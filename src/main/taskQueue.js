@@ -93,23 +93,25 @@ class TaskQueue extends EventEmitter {
     try {
       const results = await this.engine.executeEngagementTask(task, onProgress, signal);
       const status = signal.aborted ? 'stopped' : 'completed';
-      const successCount = results.filter(r => r.status === 'success').length;
-      const errorCount = results.filter(r => r.status === 'error').length;
+
+      // results is { views, likes, comments, errors } — not an array
+      const successCount = (results.views || 0) + (results.likes || 0) + (results.comments || 0);
+      const errorCount = results.errors || 0;
 
       this.updateTask(id, {
         status, results,
         completedAt: new Date().toISOString(),
         progress: signal.aborted ? undefined : 100,
-        completedItems: results.length,
+        completedItems: (results.views || 0),
         successItems: successCount,
         errorItems: errorCount,
       });
       this.emit('taskLog', {
         level: status === 'completed' ? 'success' : 'warn',
-        message: `Task ${id.substring(0, 8)}: ${status} (${successCount} ok, ${errorCount} errors)`,
+        message: `Task ${id.substring(0, 8)}: ${status} (views: ${results.views || 0}, likes: ${results.likes || 0}, comments: ${results.comments || 0}, errors: ${errorCount})`,
       });
     } catch (e) {
-      this.updateTask(id, { status: 'error', completedAt: new Date().toISOString(), results: [{ error: e.message }] });
+      this.updateTask(id, { status: 'error', completedAt: new Date().toISOString(), results: { error: e.message } });
       this.emit('taskLog', { level: 'error', message: `Task ${id.substring(0, 8)} error: ${e.message}` });
     } finally {
       this.abortControllers.delete(id);

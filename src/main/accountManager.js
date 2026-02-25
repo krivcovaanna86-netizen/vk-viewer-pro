@@ -53,22 +53,53 @@ class AccountManager {
    * Import from logpass text: login:password per line
    */
   bulkImportLogpass(rawText) {
-    const lines = rawText.split('\n').filter(l => l.trim() && l.includes(':'));
+    const lines = rawText.split(/[\r\n]+/).filter(l => l.trim());
     let created = 0;
-    const accounts = [];
+    let skipped = 0;
+    const importedAccounts = [];
 
     for (const line of lines) {
       const trimmed = line.trim();
-      const colonIdx = trimmed.indexOf(':');
-      if (colonIdx <= 0) continue;
+      if (!trimmed) continue;
 
-      const login = trimmed.substring(0, colonIdx).trim();
-      const password = trimmed.substring(colonIdx + 1).trim();
+      // Support formats: login:password, login;password, login password (tab)
+      let login, password;
+      
+      // Try colon separator first
+      const colonIdx = trimmed.indexOf(':');
+      if (colonIdx > 0) {
+        login = trimmed.substring(0, colonIdx).trim();
+        password = trimmed.substring(colonIdx + 1).trim();
+      } else {
+        // Try semicolon
+        const semiIdx = trimmed.indexOf(';');
+        if (semiIdx > 0) {
+          login = trimmed.substring(0, semiIdx).trim();
+          password = trimmed.substring(semiIdx + 1).trim();
+        } else {
+          // Try tab
+          const tabIdx = trimmed.indexOf('\t');
+          if (tabIdx > 0) {
+            login = trimmed.substring(0, tabIdx).trim();
+            password = trimmed.substring(tabIdx + 1).trim();
+          } else {
+            continue;
+          }
+        }
+      }
+
       if (!login || !password) continue;
 
-      // Check duplicate
+      // Check duplicate (read fresh from store each time since add() modifies it)
       const existing = this.getAll().find(a => a.login === login && a.authType === 'logpass');
-      if (existing) continue;
+      if (existing) {
+        // Update password if it changed
+        if (existing.password !== password) {
+          this.updateAccount(existing.id, { password, status: 'unchecked', lastCheck: null });
+        }
+        skipped++;
+        continue;
+      }
 
       const account = this.add({
         name: login,
@@ -77,11 +108,11 @@ class AccountManager {
         password,
         notes: 'Imported from logpass',
       });
-      accounts.push(account);
+      importedAccounts.push(account);
       created++;
     }
 
-    return { created, total: lines.length, accounts };
+    return { created, total: lines.length, skipped, accounts: importedAccounts };
   }
 
   /**
