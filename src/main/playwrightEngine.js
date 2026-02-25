@@ -6,7 +6,7 @@
  * Features: VK login, cookie management, warm-up, search, watch, like, comment
  */
 
-const { chromium } = require('playwright-core');
+const { chromium } = require('playwright');
 const { FingerprintGenerator } = require('fingerprint-generator');
 const { FingerprintInjector } = require('fingerprint-injector');
 const path = require('path');
@@ -16,8 +16,10 @@ const http = require('http');
 const https = require('https');
 
 class PlaywrightEngine {
-  constructor(store) {
+  constructor(store, proxyManager, accountManager) {
     this.store = store;
+    this.proxyManager = proxyManager || null;
+    this.accountManager = accountManager || null;
     this.activeContexts = new Map();
     this.log = console.log;
   }
@@ -93,6 +95,51 @@ class PlaywrightEngine {
   // BROWSER LAUNCH
   // ============================================================
 
+  /**
+   * Finds real Chrome/Chromium executable on the system.
+   * Playwright's bundled Chromium has NO proprietary codecs (H.264, AAC)
+   * and NO Widevine DRM → VK Video literally cannot play.
+   * We MUST use the real Chrome with `channel: 'chrome'` or `executablePath`.
+   */
+  _findChromeExecutable() {
+    const candidates = process.platform === 'win32'
+      ? [
+          process.env['PROGRAMFILES'] + '\\Google\\Chrome\\Application\\chrome.exe',
+          process.env['PROGRAMFILES(X86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
+          process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+          process.env['PROGRAMFILES'] + '\\Chromium\\Application\\chrome.exe',
+          // Edge as fallback (also has codecs)
+          process.env['PROGRAMFILES(X86)'] + '\\Microsoft\\Edge\\Application\\msedge.exe',
+          process.env['PROGRAMFILES'] + '\\Microsoft\\Edge\\Application\\msedge.exe',
+        ]
+      : process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Chromium.app/Contents/MacOS/Chromium',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        ]
+      : [
+          // Linux
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/chromium-browser',
+          '/usr/bin/chromium',
+          '/snap/bin/chromium',
+          '/usr/bin/microsoft-edge',
+          '/usr/bin/microsoft-edge-stable',
+        ];
+
+    for (const p of candidates) {
+      try {
+        if (p && fs.existsSync(p)) {
+          this.log(`[Engine] Found Chrome: ${p}`);
+          return p;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
   async _launchContext(options = {}) {
     const settings = this.store.get('settings') || {};
     const headless = options.headless !== undefined ? options.headless : (settings.headless !== undefined ? settings.headless : false);
@@ -123,17 +170,24 @@ class PlaywrightEngine {
         '--no-sandbox',
         '--window-size=1920,1080',
         '--lang=ru-RU',
-        // ── Media / Video playback flags ──
+        // ── Media / Video playback ──
         '--autoplay-policy=no-user-gesture-required',
-        '--enable-features=VaapiVideoDecoder,VaapiVideoEncoder',
-        '--use-gl=angle',
-        '--enable-gpu-rasterization',
-        '--enable-accelerated-video-decode',
         '--ignore-gpu-blocklist',
-        // ── DRM (Widevine) for protected content ──
-        '--enable-features=CdmHostVerification',
+        '--enable-gpu-rasterization',
       ],
     };
+
+    // ── Use REAL Chrome (with codecs + DRM) instead of Playwright Chromium ──
+    // Playwright Chromium = no H.264, no AAC, no Widevine → VK Video won't play
+    const chromeExe = this._findChromeExecutable();
+    if (chromeExe) {
+      launchOpts.executablePath = chromeExe;
+      this.log(`[Engine] Using real Chrome: ${chromeExe}`);
+    } else {
+      // Fallback: try channel:'chrome' (Playwright auto-finds Chrome)
+      launchOpts.channel = 'chrome';
+      this.log('[Engine] Using channel:chrome (Playwright will find Chrome)');
+    }
 
     if (options.proxy) {
       launchOpts.proxy = typeof options.proxy === 'string' 
@@ -142,6 +196,8 @@ class PlaywrightEngine {
     }
 
     let browser;
+    let usedFallbackChromium = false;
+
     try {
       // Try playwright-extra with stealth if available and enabled
       if (stealth) {
@@ -150,18 +206,45 @@ class PlaywrightEngine {
           const StealthPlugin = require('puppeteer-extra-plugin-stealth');
           stealthChromium.use(StealthPlugin());
           browser = await stealthChromium.launch(launchOpts);
-          this.log('[Engine] Launched with stealth plugin');
+          this.log('[Engine] Launched real Chrome + stealth plugin');
         } catch (e) {
-          browser = await chromium.launch(launchOpts);
-          this.log('[Engine] Launched plain (stealth not available)');
+          this.log(`[Engine] Stealth launch failed: ${e.message}`);
+          try {
+            browser = await chromium.launch(launchOpts);
+            this.log('[Engine] Launched real Chrome (plain)');
+          } catch (e2) {
+            // If real Chrome fails, fall back to Playwright Chromium
+            this.log(`[Engine] Real Chrome failed: ${e2.message}`);
+            delete launchOpts.executablePath;
+            delete launchOpts.channel;
+            browser = await chromium.launch(launchOpts);
+            usedFallbackChromium = true;
+            this.log('[Engine] ⚠️ Fell back to Playwright Chromium (NO video codecs!)');
+          }
         }
       } else {
-        browser = await chromium.launch(launchOpts);
-        this.log('[Engine] Launched plain');
+        try {
+          browser = await chromium.launch(launchOpts);
+          this.log('[Engine] Launched real Chrome (plain)');
+        } catch (e) {
+          delete launchOpts.executablePath;
+          delete launchOpts.channel;
+          browser = await chromium.launch(launchOpts);
+          usedFallbackChromium = true;
+          this.log('[Engine] ⚠️ Fell back to Playwright Chromium (NO video codecs!)');
+        }
       }
     } catch (e) {
+      delete launchOpts.executablePath;
+      delete launchOpts.channel;
       browser = await chromium.launch(launchOpts);
-      this.log('[Engine] Launched plain (fallback)');
+      usedFallbackChromium = true;
+      this.log('[Engine] ⚠️ Last resort: Playwright Chromium (NO video codecs!)');
+    }
+
+    if (usedFallbackChromium) {
+      this.log('[Engine] ⚠️ WARNING: Videos will NOT play without real Chrome!');
+      this.log('[Engine] ⚠️ Install Google Chrome: https://www.google.com/chrome/');
     }
 
     // ── Build context options ──
@@ -171,8 +254,6 @@ class PlaywrightEngine {
       // Use fingerprint UA or a current realistic one
       userAgent: fingerprintData?.navigator?.userAgent 
         || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      // Permissions needed for media playback
-      permissions: ['geolocation'],
       bypassCSP: true,
     };
 
@@ -202,10 +283,12 @@ class PlaywrightEngine {
     }
 
     // ── Block known tracking/error endpoints that cause console noise ──
+    // These are VK analytics/monitoring — they fail with CORS but don't affect functionality
     try {
       await context.route('**/stats.vk-portal.net/**', route => route.abort());
       await context.route('**/sentry.mvk.com/**', route => route.abort());
       await context.route('**/top-fwz1.mail.ru/**', route => route.abort());
+      await context.route('**/akashi.vk-portal.net/**', route => route.abort());
     } catch (e) {
       this.log(`[Engine] Route blocking failed: ${e.message}`);
     }
@@ -240,6 +323,40 @@ class PlaywrightEngine {
   async _humanDelay(minMs = 500, maxMs = 2000) {
     const delay = this._randomDelay(minMs, maxMs);
     await new Promise(r => setTimeout(r, delay));
+  }
+
+  /**
+   * Safe page navigation that NEVER throws on timeout.
+   * VK SPA pages often never fire 'load' because analytics/tracking resources
+   * hang forever (stats.vk-portal.net, top-fwz1.mail.ru, etc.).
+   * 
+   * Uses 'domcontentloaded' instead of 'load', catches timeout gracefully,
+   * and checks if the page actually navigated.
+   */
+  async _safeGoto(page, url, opts = {}) {
+    const timeout = opts.timeout || 30000;
+    const label = opts.label || url;
+    const startMs = Date.now();
+    this.log(`[Nav] Navigating to ${label}...`);
+
+    try {
+      // domcontentloaded fires when HTML is parsed — don't wait for all resources
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+    } catch (e) {
+      const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+      // If page actually navigated (URL changed), treat as partial success
+      const currentUrl = page.url();
+      if (currentUrl.includes(new URL(url).hostname) || currentUrl !== 'about:blank') {
+        this.log(`[Nav] Partial load for ${label} (${elapsed}s) — page URL: ${currentUrl.substring(0, 80)}`);
+      } else {
+        this.log(`[Nav] Failed to navigate to ${label} after ${elapsed}s: ${e.message.substring(0, 100)}`);
+        return false;
+      }
+    }
+
+    const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+    this.log(`[Nav] Loaded ${label} in ${elapsed}s`);
+    return true;
   }
 
   /**
@@ -333,7 +450,7 @@ class PlaywrightEngine {
     try {
       // ── Step 1: Navigate to vk.com ──
       this.log('[VK Login] Step 1: Navigating to vk.com...');
-      await page.goto('https://vk.com/', { waitUntil: 'load', timeout: 30000 });
+      await this._safeGoto(page, 'https://vk.com/', { label: 'vk.com main', timeout: 25000 });
       // Wait for VK SPA to render — without this the page "drifts" and bot clicks on nothing
       await this._waitForPageReady(page);
       await this._humanDelay(2000, 3000);
@@ -402,7 +519,7 @@ class PlaywrightEngine {
       // If still not found, go directly to id.vk.com
       if (!foundAltLogin) {
         this.log('[VK Login] Alt login not found, navigating to id.vk.com/auth...');
-        await page.goto('https://id.vk.com/auth', { waitUntil: 'load', timeout: 30000 });
+        await this._safeGoto(page, 'https://id.vk.com/auth', { label: 'id.vk.com/auth fallback', timeout: 25000 });
         await this._waitForPageReady(page);
         await this._humanDelay(2000, 3000);
       }
@@ -936,7 +1053,7 @@ class PlaywrightEngine {
 
       // Navigate to feed to double-check (Python ref: "feed" in current_url)
       try {
-        await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
+        await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (final verify)', timeout: 20000 });
         await this._humanDelay(2000, 3000);
         
         if (await this._checkVKLogin(page)) {
@@ -1113,7 +1230,7 @@ class PlaywrightEngine {
 
       if (!clicked) break;
 
-      await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
       await this._humanDelay(1500, 2500);
     }
   }
@@ -1818,7 +1935,7 @@ class PlaywrightEngine {
           triedSession = true;
 
           const page = await context.newPage();
-          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 30000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify session)', timeout: 25000 });
           await this._waitForPageReady(page);
           await this._humanDelay(1000, 2000);
           isLoggedIn = await this._checkVKLogin(page);
@@ -1847,7 +1964,7 @@ class PlaywrightEngine {
           }
 
           const page = await context.newPage();
-          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 30000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify cookies)', timeout: 25000 });
           await this._waitForPageReady(page);
           await this._humanDelay(1000, 2000);
           isLoggedIn = await this._checkVKLogin(page);
@@ -1914,7 +2031,8 @@ class PlaywrightEngine {
         }
         
         const page = await context.newPage();
-        await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 30000 });
+        await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify cookie account)', timeout: 25000 });
+        await this._waitForPageReady(page);
         await this._humanDelay(2000, 4000);
         isLoggedIn = await this._checkVKLogin(page);
       }
@@ -1992,7 +2110,7 @@ class PlaywrightEngine {
         case 'chill': {
           // Just browse the feed
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'warmup:chill', timeout: 20000 });
           const scrollCount = this._randomDelay(warmUp.homePageMin || 3, warmUp.homePageMax || 8);
           for (let i = 0; i < scrollCount; i++) {
             if (!pageAlive()) return;
@@ -2008,7 +2126,7 @@ class PlaywrightEngine {
         case 'curious': {
           // Browse feed, click on a video/post
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'warmup:curious', timeout: 20000 });
           await this._humanDelay(2000, 4000);
           // Scroll a bit
           for (let i = 0; i < 3; i++) {
@@ -2032,10 +2150,10 @@ class PlaywrightEngine {
 
         case 'explorer': {
           // Visit random VK sections
-          const destinations = ['https://vk.com/video', 'https://vk.com/clips', 'https://vk.com/discover'];
+          const destinations = ['https://vkvideo.ru', 'https://vk.com/clips', 'https://vk.com/discover'];
           const dest = destinations[Math.floor(Math.random() * destinations.length)];
           if (!pageAlive()) return;
-          await page.goto(dest, { waitUntil: 'load', timeout: 15000 });
+          await this._safeGoto(page, dest, { label: `warmup:explorer → ${dest}`, timeout: 20000 });
           await this._humanDelay(2000, 4000);
           const scrolls = this._randomDelay(2, 5);
           for (let i = 0; i < scrolls; i++) {
@@ -2047,11 +2165,11 @@ class PlaywrightEngine {
         }
 
         case 'searcher': {
-          // Search for something
+          // Search for something on vkvideo.ru
           const queries = ['музыка 2025', 'смешные видео', 'новости', 'рецепты', 'фильмы', 'мемы'];
           const query = queries[Math.floor(Math.random() * queries.length)];
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/video', { waitUntil: 'load', timeout: 15000 });
+          await this._safeGoto(page, 'https://vkvideo.ru', { label: 'warmup:searcher', timeout: 20000 });
           await this._humanDelay(1000, 2000);
           try {
             const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[name="q"]').first();
@@ -2072,7 +2190,7 @@ class PlaywrightEngine {
         case 'impatient': {
           // Quick browse, leave fast
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'warmup:impatient', timeout: 15000 });
           await this._humanDelay(1000, 3000);
           await page.mouse.wheel(0, 300);
           await this._humanDelay(500, 1500);
@@ -2089,29 +2207,40 @@ class PlaywrightEngine {
   // ============================================================
 
   async searchAndFindVideo(page, keywords, targetUrl) {
-    this.log(`[Search] Searching for video: ${keywords || targetUrl}`);
+    this.log(`[Search] Searching for video: keywords="${keywords || 'none'}", target=${targetUrl || 'none'}`);
     
     // Extract video ID from target URL for matching (e.g., "video-224119603_456311034")
     let targetVideoId = null;
     if (targetUrl) {
       const match = targetUrl.match(/(video-?\d+_\d+)/);
       if (match) targetVideoId = match[1];
+      this.log(`[Search] Target video ID: ${targetVideoId || 'could not parse'}`);
     }
     
     try {
-      // Navigate to VK Video (vkvideo.ru is the new VK video domain)
-      await page.goto('https://vk.com/video', { waitUntil: 'load', timeout: 20000 });
+      // ── Navigate to VKVideo (vkvideo.ru is the current VK video domain) ──
+      // NOTE: vk.com/video often hangs on 'load' due to analytics resources.
+      // vkvideo.ru is the actual video search page now.
+      const searchUrl = 'https://vkvideo.ru';
+      const navOk = await this._safeGoto(page, searchUrl, { label: 'VKVideo search page', timeout: 30000 });
+      if (!navOk) {
+        // Fallback: try vk.com/video
+        this.log('[Search] vkvideo.ru failed, trying vk.com/video...');
+        await this._safeGoto(page, 'https://vk.com/video', { label: 'VK Video fallback', timeout: 30000 });
+      }
       await this._waitForPageReady(page);
       await this._humanDelay(2000, 3000);
 
       if (keywords) {
+        this.log(`[Search] Looking for search input on ${page.url().substring(0, 50)}...`);
+
         // Primary: use data-testid from codegen recording
         let searchInput = null;
         try {
           const testIdInput = page.getByTestId('top-search-video-input');
           if (await testIdInput.isVisible({ timeout: 3000 })) {
             searchInput = testIdInput;
-            this.log('[Search] Found search input via data-testid');
+            this.log('[Search] Found search input via data-testid="top-search-video-input"');
           }
         } catch (e) {}
 
@@ -2122,6 +2251,7 @@ class PlaywrightEngine {
             'input[placeholder*="Поиск"]',
             'input[placeholder*="Search"]',
             'input[name="q"]',
+            'input[class*="search"]',
           ];
           for (const sel of searchSelectors) {
             try {
@@ -2141,61 +2271,76 @@ class PlaywrightEngine {
           await searchInput.fill(keywords);
           await this._humanDelay(300, 600);
           await searchInput.press('Enter');
-          this.log(`[Search] Searched for: "${keywords}"`);
+          this.log(`[Search] Submitted search: "${keywords.substring(0, 50)}"`);
           
-          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+          // Wait for results — use domcontentloaded, never load
+          await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
           await this._humanDelay(3000, 5000);
 
+          this.log(`[Search] Results page: ${page.url().substring(0, 80)}`);
+
           // Scroll through results to load more
-          for (let scroll = 0; scroll < 3; scroll++) {
+          for (let scroll = 0; scroll < 4; scroll++) {
             await page.mouse.wheel(0, this._randomDelay(300, 600));
-            await this._humanDelay(1000, 2000);
+            await this._humanDelay(1500, 2500);
           }
 
           // Look for the target video in results
           if (targetVideoId) {
+            this.log(`[Search] Scanning results for video ID: ${targetVideoId}`);
             const found = await page.evaluate((videoId) => {
-              const links = document.querySelectorAll('a[href*="/video"]');
+              const links = document.querySelectorAll('a[href*="/video"], a[href*="video-"]');
+              const allHrefs = [];
               for (const link of links) {
                 const href = link.href || link.getAttribute('href') || '';
                 if (href.includes(videoId)) {
                   link.scrollIntoView({ behavior: 'smooth', block: 'center' });
                   link.click();
-                  return { found: true, href };
+                  return { found: true, href, total: links.length };
                 }
+                if (href.includes('video')) allHrefs.push(href.substring(0, 80));
               }
-              return { found: false };
+              return { found: false, total: links.length, sample: allHrefs.slice(0, 5) };
             }, targetVideoId);
 
             if (found.found) {
-              this.log(`[Search] Found target video in results: ${found.href}`);
+              this.log(`[Search] ✅ Found target video in results (${found.total} links scanned): ${found.href}`);
               await this._humanDelay(2000, 3000);
               return true;
             }
             
-            this.log('[Search] Target video not found in search results, navigating directly...');
+            this.log(`[Search] Target video not in results (${found.total} links scanned). Sample: ${JSON.stringify(found.sample || [])}`);
           }
+        } else {
+          this.log('[Search] ⚠️ Search input not found on page');
         }
       }
       
       // Fallback: navigate directly to target URL
       if (targetUrl) {
-        this.log(`[Search] Navigating directly to: ${targetUrl}`);
-        await page.goto(targetUrl, { waitUntil: 'load', timeout: 20000 });
-        await this._waitForPageReady(page);
-        await this._humanDelay(2000, 3000);
-        return true;
+        this.log(`[Search] Navigating directly to video: ${targetUrl}`);
+        const directOk = await this._safeGoto(page, targetUrl, { label: 'target video', timeout: 30000 });
+        if (directOk) {
+          await this._waitForPageReady(page);
+          await this._humanDelay(2000, 3000);
+          this.log(`[Search] Direct navigation OK, current URL: ${page.url().substring(0, 80)}`);
+          return true;
+        }
+        // Even if _safeGoto returned false, page might have partially loaded
+        this.log(`[Search] Direct navigation partial, current URL: ${page.url().substring(0, 80)}`);
+        return page.url() !== 'about:blank';
       }
 
       return false;
     } catch (error) {
       this.log(`[Search] Error: ${error.message}`);
       if (targetUrl) {
-        try {
-          await page.goto(targetUrl, { waitUntil: 'load', timeout: 20000 });
+        this.log('[Search] Attempting direct fallback navigation...');
+        const ok = await this._safeGoto(page, targetUrl, { label: 'video fallback', timeout: 30000 });
+        if (ok) {
           await this._humanDelay(2000, 3000);
           return true;
-        } catch (e) {}
+        }
       }
       return false;
     }
@@ -2207,16 +2352,41 @@ class PlaywrightEngine {
     const watchMax = duration || settings.watchDuration?.max || 120;
     const watchTime = this._randomDelay(watchMin, watchMax);
     
-    this.log(`[Watch] Watching for ${watchTime} seconds...`);
+    this.log(`[Watch] Target watch time: ${watchTime}s (range ${watchMin}-${watchMax}s)`);
     
     try {
-      // ── Step 1: Ensure video is playing ──
-      // VK Video uses <video> element — try to find and play it
-      let videoPlaying = false;
-
-      // Click the video player area to start playback (VK auto-pauses for bots)
+      // ── Step 0: Wait for video element to appear ──
+      this.log('[Watch] Waiting for <video> element...');
+      let videoFound = false;
       try {
-        // Try clicking the video element directly
+        await page.waitForSelector('video', { timeout: 10000, state: 'attached' });
+        videoFound = true;
+        this.log('[Watch] <video> element found in DOM');
+      } catch (e) {
+        this.log('[Watch] ⚠️ No <video> element found after 10s');
+      }
+
+      // ── Step 1: Get initial video state ──
+      if (videoFound) {
+        const initialState = await page.evaluate(() => {
+          const videos = document.querySelectorAll('video');
+          return Array.from(videos).map((v, i) => ({
+            index: i,
+            src: (v.src || v.currentSrc || '').substring(0, 80),
+            readyState: v.readyState,
+            paused: v.paused,
+            muted: v.muted,
+            duration: isFinite(v.duration) ? Math.round(v.duration) : 'unknown',
+            currentTime: Math.round(v.currentTime),
+            width: v.videoWidth,
+            height: v.videoHeight,
+          }));
+        }).catch(() => []);
+        this.log(`[Watch] Video elements: ${JSON.stringify(initialState)}`);
+      }
+
+      // ── Step 2: Click to start playback ──
+      try {
         const videoEl = page.locator('video').first();
         if (await videoEl.isVisible({ timeout: 3000 })) {
           await videoEl.click();
@@ -2225,34 +2395,37 @@ class PlaywrightEngine {
         }
       } catch (e) {}
 
-      // Check if video is actually playing, force play if not
-      try {
-        videoPlaying = await page.evaluate(() => {
-          const videos = document.querySelectorAll('video');
-          for (const video of videos) {
-            if (video.paused || video.ended) {
-              // Force play
-              video.muted = true; // Mute to allow autoplay
-              video.play().catch(() => {});
-            }
-            // Remove any overlays that block playback
-            const overlays = document.querySelectorAll(
-              '[class*="overlay"], [class*="Overlay"], [class*="promo"], [class*="Promo"]'
-            );
-            overlays.forEach(el => {
-              if (el.style) el.style.display = 'none';
-            });
-            return !video.paused;
-          }
-          return false;
-        });
-        if (videoPlaying) {
-          this.log('[Watch] Video is playing');
+      // ── Step 3: Force play + mute (allows autoplay) ──
+      const playResult = await page.evaluate(() => {
+        const videos = document.querySelectorAll('video');
+        const results = [];
+        for (const video of videos) {
+          video.muted = true;
+          // Remove overlays that might block playback
+          document.querySelectorAll(
+            '[class*="overlay"], [class*="Overlay"], [class*="promo"], [class*="Promo"]'
+          ).forEach(el => { if (el.style) el.style.display = 'none'; });
+          
+          try { video.play(); } catch (e) {}
+          
+          results.push({
+            paused: video.paused,
+            duration: isFinite(video.duration) ? Math.round(video.duration) : -1,
+            currentTime: Math.round(video.currentTime),
+            readyState: video.readyState,
+          });
         }
-      } catch (e) {}
+        return results;
+      }).catch(() => []);
 
-      // Click play button if video still not playing
-      if (!videoPlaying) {
+      const mainVideo = playResult[0];
+      if (mainVideo) {
+        const durStr = mainVideo.duration > 0 ? `${mainVideo.duration}s` : 'unknown';
+        this.log(`[Watch] After play(): paused=${mainVideo.paused}, duration=${durStr}, readyState=${mainVideo.readyState}`);
+      }
+
+      // ── Step 4: Click play button if video still not playing ──
+      if (!mainVideo || mainVideo.paused) {
         const playSelectors = [
           'button[class*="play" i]',
           '[class*="videoplayer"] button',
@@ -2266,47 +2439,72 @@ class PlaywrightEngine {
             const btn = page.locator(sel).first();
             if (await btn.isVisible({ timeout: 1500 })) {
               await btn.click();
-              this.log(`[Watch] Clicked play: ${sel}`);
+              this.log(`[Watch] Clicked play button: ${sel}`);
               await this._humanDelay(500, 1000);
               break;
             }
           } catch (e) {}
         }
+
+        // Final force play
+        await page.evaluate(() => {
+          document.querySelectorAll('video').forEach(v => {
+            v.muted = true;
+            try { v.play(); } catch (e) {}
+          });
+        }).catch(() => {});
       }
 
-      // ── Step 2: Final force play attempt ──
-      await page.evaluate(() => {
-        document.querySelectorAll('video').forEach(v => {
-          v.muted = true;
-          v.play().catch(() => {});
-        });
-      }).catch(() => {});
+      // ── Step 5: Wait for metadata to load (duration becomes available) ──
+      if (videoFound) {
+        try {
+          await page.waitForFunction(() => {
+            const v = document.querySelector('video');
+            return v && isFinite(v.duration) && v.duration > 0;
+          }, { timeout: 8000 });
+          this.log('[Watch] Video metadata loaded');
+        } catch (e) {
+          this.log('[Watch] ⚠️ Video duration still unavailable after 8s');
+        }
+      }
 
-      // ── Step 3: Watch with human-like behavior ──
+      // ── Step 6: Watch loop with human-like behavior ──
       const startTime = Date.now();
       let lastProgressCheck = 0;
+      let videoDuration = 'unknown';
       
       while ((Date.now() - startTime) / 1000 < watchTime) {
-        if (page.isClosed()) break;
+        if (page.isClosed()) {
+          this.log('[Watch] Page closed, stopping');
+          break;
+        }
         
-        // Periodic check: is video still playing?
-        const elapsed = (Date.now() - startTime) / 1000;
-        if (elapsed - lastProgressCheck > 15) {
+        // Periodic check every 15s
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        if (elapsed - lastProgressCheck >= 15) {
           lastProgressCheck = elapsed;
           try {
             const status = await page.evaluate(() => {
               const v = document.querySelector('video');
               if (!v) return { found: false };
-              if (v.paused) { v.muted = true; v.play().catch(() => {}); }
+              if (v.paused && !v.ended) { v.muted = true; try { v.play(); } catch (e) {} }
               return { 
                 found: true, 
                 paused: v.paused, 
+                ended: v.ended,
                 currentTime: Math.round(v.currentTime),
-                duration: Math.round(v.duration || 0),
+                duration: isFinite(v.duration) ? Math.round(v.duration) : -1,
+                readyState: v.readyState,
+                buffered: v.buffered.length > 0 ? Math.round(v.buffered.end(v.buffered.length - 1)) : 0,
               };
             });
             if (status.found) {
-              this.log(`[Watch] Progress: ${status.currentTime}s / ${status.duration}s ${status.paused ? '(PAUSED - restarting)' : ''}`);
+              const durStr = status.duration > 0 ? `${status.duration}s` : '?';
+              videoDuration = durStr;
+              const state = status.paused ? 'PAUSED' : status.ended ? 'ENDED' : 'PLAYING';
+              this.log(`[Watch] ${elapsed}s/${watchTime}s — video: ${status.currentTime}s/${durStr} [${state}] buffered:${status.buffered}s readyState:${status.readyState}`);
+            } else {
+              this.log(`[Watch] ${elapsed}s/${watchTime}s — no <video> element found`);
             }
           } catch (e) {}
         }
@@ -2324,7 +2522,8 @@ class PlaywrightEngine {
         await this._humanDelay(3000, 8000);
       }
       
-      this.log('[Watch] Done watching');
+      const totalWatched = Math.round((Date.now() - startTime) / 1000);
+      this.log(`[Watch] ✅ Done — watched ${totalWatched}s (target was ${watchTime}s), video duration: ${videoDuration}`);
       return true;
     } catch (error) {
       this.log(`[Watch] Error: ${error.message}`);
@@ -2526,19 +2725,33 @@ class PlaywrightEngine {
   async _executeSingleOp(op, task, settings) {
     const { accountId, proxyId, shouldLike, shouldComment, commentText } = op;
     const { videoUrl, searchKeywords, useSearch } = task;
+    const opStart = Date.now();
 
     const accounts = this.store.get('accounts') || [];
     const account = accounts.find(a => a.id === accountId);
-    if (!account) return { error: 'Account not found' };
+    if (!account) {
+      this.log(`[Op] ❌ Account ${accountId} not found in store`);
+      return { error: 'Account not found' };
+    }
 
     let proxyUrl = null;
+    let proxyInfo = 'none';
     if (proxyId) {
       const proxies = this.store.get('proxies') || [];
       const proxy = proxies.find(p => p.id === proxyId);
-      if (proxy) proxyUrl = this._buildProxyUrl(proxy);
+      if (proxy) {
+        proxyUrl = this._buildProxyUrl(proxy);
+        proxyInfo = `${proxy.type}://${proxy.host}:${proxy.port} (${proxy.country || proxy.countryCode || '?'}) status=${proxy.status}`;
+      } else {
+        this.log(`[Op] ⚠️ Proxy ${proxyId} not found`);
+      }
     }
 
-    this.log(`[Op] Account: ${account.login?.substring(0, 4) || accountId}***, Proxy: ${proxyUrl ? 'yes' : 'no'}`);
+    this.log(`[Op] ─── Starting operation ───`);
+    this.log(`[Op] Account: ${account.login?.substring(0, 6) || accountId.substring(0, 8)}***, type=${account.authType}, status=${account.status}, hasCookies=${account.hasCookies}`);
+    this.log(`[Op] Proxy: ${proxyInfo}`);
+    this.log(`[Op] Video: ${videoUrl}`);
+    this.log(`[Op] Plan: view=yes${shouldLike ? ', like=yes' : ''}${shouldComment ? ', comment=yes' : ''}, search=${useSearch ? `"${searchKeywords?.substring(0, 40)}"` : 'direct'}`);
 
     const cookiesDir = path.join(app.getPath('userData'), 'accounts');
     const statePath = path.join(cookiesDir, `${accountId}_state.json`);
@@ -2555,15 +2768,22 @@ class PlaywrightEngine {
       // Prefer storageState (restores cookies + localStorage in one step)
       if (account.hasCookies && fs.existsSync(statePath)) {
         launchOpts.storageStatePath = statePath;
+        this.log('[Op] Using saved storage state');
+      } else if (account.hasCookies && fs.existsSync(cookiesPath)) {
+        this.log('[Op] Using saved cookies (no storage state)');
+      } else {
+        this.log('[Op] No saved session — will need full login');
       }
 
+      const launchStart = Date.now();
       const { context, contextId: cId } = await this._launchContext(launchOpts);
       contextId = cId;
+      this.log(`[Op] Browser launched in ${((Date.now() - launchStart) / 1000).toFixed(1)}s`);
 
       const page = await context.newPage();
       const result = { viewed: false, liked: false, commented: false, error: false };
 
-      // Check if session works
+      // ── Check session ──
       let loggedIn = false;
       if (account.hasCookies) {
         // If no storageState was loaded, try manual cookies
@@ -2571,60 +2791,76 @@ class PlaywrightEngine {
           try {
             const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf-8'));
             await this._loadCookies(context, cookies);
-          } catch (e) {}
+            this.log(`[Op] Loaded ${cookies.length} cookies manually`);
+          } catch (e) {
+            this.log(`[Op] Failed to load cookies: ${e.message}`);
+          }
         }
           
-        await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 20000 });
-        await this._waitForPageReady(page);
-        await this._humanDelay(1000, 2000);
-        loggedIn = await this._checkVKLogin(page);
+        const navOk = await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (session check)', timeout: 25000 });
+        if (navOk) {
+          await this._waitForPageReady(page);
+          await this._humanDelay(1000, 2000);
+          loggedIn = await this._checkVKLogin(page);
+        }
         
         if (loggedIn) {
-          this.log('[Op] Logged in via saved session');
+          this.log('[Op] ✅ Logged in via saved session');
+        } else {
+          this.log('[Op] Session expired or invalid');
         }
       }
       
-      // If not logged in, do full login
+      // ── Full login if needed ──
       if (!loggedIn) {
         if (account.authType === 'logpass' && account.login && account.password) {
           this.log('[Op] Performing full login...');
+          const loginStart = Date.now();
           const loginResult = await this.loginVK(page, account.login, account.password);
+          const loginTime = ((Date.now() - loginStart) / 1000).toFixed(1);
           if (loginResult.success) {
             loggedIn = true;
-            // Save session for next time
+            this.log(`[Op] ✅ Login successful in ${loginTime}s`);
             await this._saveSession(context, accountId);
           } else {
+            this.log(`[Op] ❌ Login failed in ${loginTime}s: ${loginResult.error}`);
             result.error = true;
             await this._safeClose(contextId);
             return result;
           }
         } else {
+          this.log('[Op] ❌ No credentials available for login');
           result.error = true;
           await this._safeClose(contextId);
           return result;
         }
       }
 
-      // Warm-up browsing
+      // ── Warm-up browsing ──
       if (settings.warmUp) {
+        const warmStart = Date.now();
         await this.warmUpBrowsing(page);
+        this.log(`[Op] Warm-up completed in ${((Date.now() - warmStart) / 1000).toFixed(1)}s`);
       }
 
-      // Navigate to video
+      // ── Navigate to video ──
+      const navStart = Date.now();
       if (useSearch && searchKeywords) {
         const found = await this.searchAndFindVideo(page, searchKeywords, videoUrl);
-        // If search did not navigate to any video, go directly
         if (!found && videoUrl) {
           this.log('[Op] Search failed, navigating directly to video URL...');
-          await page.goto(videoUrl, { waitUntil: 'load', timeout: 20000 });
+          await this._safeGoto(page, videoUrl, { label: 'video direct', timeout: 30000 });
           await this._humanDelay(2000, 3000);
         }
       } else {
-        await page.goto(videoUrl, { waitUntil: 'load', timeout: 20000 });
+        await this._safeGoto(page, videoUrl, { label: 'video direct', timeout: 30000 });
+        await this._waitForPageReady(page);
         await this._humanDelay(2000, 3000);
       }
+      this.log(`[Op] Navigation to video took ${((Date.now() - navStart) / 1000).toFixed(1)}s`);
+      this.log(`[Op] Current URL: ${page.url().substring(0, 100)}`);
 
-      // Watch video
+      // ── Watch video ──
       const watchDuration = this._randomDelay(
         settings.watchDuration?.min || 30,
         settings.watchDuration?.max || 120
@@ -2632,23 +2868,29 @@ class PlaywrightEngine {
       await this.watchVideo(page, watchDuration);
       result.viewed = true;
 
-      // Like
+      // ── Like ──
       if (shouldLike) {
         const liked = await this.pressLike(page);
         result.liked = liked;
+        this.log(`[Op] Like: ${liked ? '✅' : '❌'}`);
       }
 
-      // Comment
+      // ── Comment ──
       if (shouldComment && commentText) {
         const commented = await this.postComment(page, commentText);
         result.commented = commented;
+        this.log(`[Op] Comment: ${commented ? '✅' : '❌'}`);
       }
+
+      const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
+      this.log(`[Op] ─── Operation complete in ${totalTime}s ─── viewed=${result.viewed}, liked=${result.liked}, commented=${result.commented}`);
 
       await this._safeClose(contextId);
       return result;
 
     } catch (error) {
-      this.log(`[Op] Error: ${error.message}`);
+      const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
+      this.log(`[Op] ❌ Error after ${totalTime}s: ${error.message}`);
       if (contextId) await this._safeClose(contextId);
       return { viewed: false, liked: false, commented: false, error: true };
     }
@@ -2698,6 +2940,38 @@ class PlaywrightEngine {
     } catch (e) {
       this.log(`[Session] Save error: ${e.message}`);
     }
+  }
+
+  // ============================================================
+  // BULK VERIFY
+  // ============================================================
+
+  /**
+   * Verifies multiple accounts in sequence.
+   * Called from main.js ipcMain handler 'account:bulkVerify'.
+   */
+  async bulkVerifyCookies(accountIds, proxyId = null, onProgress) {
+    const results = [];
+    for (let i = 0; i < accountIds.length; i++) {
+      const accountId = accountIds[i];
+      try {
+        const result = await this.verifyCookies(accountId, proxyId);
+        results.push({ accountId, ...result });
+      } catch (e) {
+        this.log(`[BulkVerify] Error for ${accountId}: ${e.message}`);
+        results.push({ accountId, valid: false, error: e.message });
+      }
+
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: accountIds.length,
+          accountId,
+          valid: results[results.length - 1].valid,
+        });
+      }
+    }
+    return results;
   }
 
   // ============================================================

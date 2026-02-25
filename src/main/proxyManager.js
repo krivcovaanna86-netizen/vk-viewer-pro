@@ -255,6 +255,11 @@ class ProxyManager {
    * Fetch proxies from Best-Proxies.ru and add to local store
    */
   async importFromBestProxies(options = {}) {
+    // Default to Russian proxies for VK engagement
+    if (!options.country) {
+      options.country = 'ru';
+    }
+    
     const list = await this.fetchFromBestProxies(options);
     let added = 0;
     const existingHosts = new Set(this.getAll().map(p => `${p.host}:${p.port}`));

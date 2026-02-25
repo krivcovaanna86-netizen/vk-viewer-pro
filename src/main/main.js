@@ -125,10 +125,10 @@ function setupIPC() {
 
   // ===== BEST-PROXIES.RU API =====
   ipcMain.handle('proxy:fetchBestProxies', async (_, opts) => {
-    sendLog('info', `Fetching proxies from Best-Proxies.ru (key: ${opts.key?.substring(0, 6)}..., type: ${opts.type || 'all'}, limit: ${opts.limit || 20})`);
+    sendLog('info', `Fetching proxies from Best-Proxies.ru (key: ${opts.key?.substring(0, 6)}..., type: ${opts.type || 'all'}, country: ${opts.country || 'ru (default)'}, limit: ${opts.limit || 20})`);
     try {
       const result = await proxyManager.importFromBestProxies(opts);
-      sendLog('success', `Best-Proxies.ru: ${result.total} fetched, ${result.added} new, ${result.skipped} skipped`);
+      sendLog('success', `Best-Proxies.ru: ${result.total} fetched, ${result.added} new, ${result.skipped} skipped (country filter: ${opts.country || 'ru'})`);
       return result;
     } catch (e) {
       sendLog('error', `Best-Proxies.ru error: ${e.message}`);
