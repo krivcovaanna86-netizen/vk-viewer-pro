@@ -77,7 +77,8 @@ function initModules() {
   accountManager = new AccountManager(store);
   playwrightEngine = new PlaywrightEngine(store, proxyManager, accountManager);
   taskQueue = new TaskQueue(store, playwrightEngine);
-  playwrightEngine.setLogCallback((level, message) => sendLog(level, message));
+  playwrightEngine.setLogger((msg) => sendLog('info', msg));
+
 }
 
 function sendLog(level, message) {

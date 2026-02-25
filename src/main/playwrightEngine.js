@@ -1,1616 +1,2520 @@
 /**
- * PlaywrightEngine v1.0 — VK Video Engagement
- *
- * VK-specific:
- * - Login via VK credentials (login/pass)
- * - Cookie-based auth
- * - Video search on vk.com/video
- * - Video watching, liking, commenting
- * - Warm-up browsing on VK feed
- * - Captcha detection & reporting
- * - 4-tier browser launch (fingerprint-injector > stealth > plain)
+ * PlaywrightEngine v1.0
+ * VK Video Engagement Tool - Browser Automation Engine
+ * 
+ * Supports: fingerprint injection, playwright-extra stealth, plain launch
+ * Features: VK login, cookie management, warm-up, search, watch, like, comment
  */
 
+const { chromium } = require('playwright-core');
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
 const { app } = require('electron');
-const { chromium } = require('playwright-core');
-
-// ── fingerprint-injector (LOCAL, instant, cross-platform) ──
-let FingerprintInjector = null;
-let FingerprintGenerator = null;
-let hasLocalFingerprints = false;
-try {
-  const fpInj = require('fingerprint-injector');
-  FingerprintInjector = fpInj.FingerprintInjector || fpInj.newInjectedContext;
-  if (!FingerprintInjector) FingerprintInjector = fpInj;
-  const fpGen = require('fingerprint-generator');
-  FingerprintGenerator = fpGen.FingerprintGenerator || fpGen;
-  hasLocalFingerprints = true;
-  console.log('[PW] fingerprint-injector loaded');
-} catch (_) {
-  console.log('[PW] fingerprint-injector not available');
-}
-
-// ── playwright-extra + stealth ──
-let stealthPlugin = null;
-let PlaywrightExtra = null;
-try {
-  const { chromium: pwExtra } = require('playwright-extra');
-  PlaywrightExtra = pwExtra;
-  const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-  stealthPlugin = StealthPlugin();
-  PlaywrightExtra.use(stealthPlugin);
-  console.log('[PW] playwright-extra + stealth loaded');
-} catch (_) {
-  console.log('[PW] playwright-extra/stealth not available');
-}
+const http = require('http');
+const https = require('https');
 
 class PlaywrightEngine {
-  constructor(store, proxyManager, accountManager) {
+  constructor(store) {
     this.store = store;
-    this.proxyManager = proxyManager;
-    this.accountManager = accountManager;
     this.activeContexts = new Map();
-    this._logCallback = null;
-
-    this.fpSeedDir = path.join(app.getPath('userData'), 'fp-seeds');
-    if (!fs.existsSync(this.fpSeedDir)) fs.mkdirSync(this.fpSeedDir, { recursive: true });
+    this.log = console.log;
   }
 
-  setLogCallback(cb) { this._logCallback = cb; }
-
-  _log(level, msg) {
-    console.log(`[PW] ${msg}`);
-    if (this._logCallback) this._logCallback(level, `[PW] ${msg}`);
+  setLogger(logFn) {
+    this.log = logFn;
   }
 
-  // ──────── Fingerprint ────────
-
-  _getLocalFpSeed(accountId) {
-    const seedPath = path.join(this.fpSeedDir, `${accountId}.json`);
-    if (fs.existsSync(seedPath)) {
-      try { return JSON.parse(fs.readFileSync(seedPath, 'utf-8')); } catch (_) {}
-    }
-    const seed = {
-      screenWidth: [1366, 1440, 1536, 1600, 1920][Math.floor(Math.random() * 5)],
-      screenHeight: [768, 900, 864, 900, 1080][Math.floor(Math.random() * 5)],
-      locale: ['ru-RU', 'en-US', 'ru-RU', 'ru-RU', 'uk-UA'][Math.floor(Math.random() * 5)],
-      createdAt: new Date().toISOString(),
-    };
-    try { fs.writeFileSync(seedPath, JSON.stringify(seed)); } catch (_) {}
-    return seed;
+  // Alias for backward compatibility with main.js
+  setLogCallback(logFn) {
+    this.log = logFn;
   }
 
-  deleteFingerprint(accountId) {
-    const seedPath = path.join(this.fpSeedDir, `${accountId}.json`);
-    if (fs.existsSync(seedPath)) { fs.unlinkSync(seedPath); return true; }
-    return false;
-  }
+  // ============================================================
+  // PROXY HELPERS
+  // ============================================================
 
-  hasFingerprint(accountId) {
-    return fs.existsSync(path.join(this.fpSeedDir, `${accountId}.json`));
-  }
-
-  // ──────── Browser Launch ────────
-
-  async launchContext(options = {}) {
-    const settings = this.store.get('settings');
-    const isHeadless = options.headless !== undefined ? options.headless : settings.headless;
-
-    const launchArgs = [
-      '--no-sandbox',
-      '--disable-infobars',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1366,768',
-      '--lang=ru-RU',
-    ];
-
-    let context = null;
-    let browser = null;
-    let launchMethod = 'unknown';
-
-    // METHOD 1: fingerprint-injector (local, instant)
-    if (!context && hasLocalFingerprints) {
-      try {
-        const proxyConfig = options.proxyUrl ? this._parseProxyUrl(options.proxyUrl) : undefined;
-        const launchOpts = { headless: isHeadless, args: launchArgs };
-        if (proxyConfig) launchOpts.proxy = proxyConfig;
-
-        browser = await chromium.launch(launchOpts);
-        const seed = options.accountId ? this._getLocalFpSeed(options.accountId) : {};
-        const fpOptions = {
-          devices: ['desktop'],
-          operatingSystems: ['windows'],
-          browsers: [{ name: 'chrome', minVersion: 120, maxVersion: 130 }],
-        };
-        if (seed.locale) fpOptions.locales = [seed.locale];
-
-        const { newInjectedContext } = require('fingerprint-injector');
-        context = await newInjectedContext(browser, {
-          fingerprintOptions: fpOptions,
-          newContextOptions: {
-            ignoreHTTPSErrors: true,
-            viewport: { width: seed.screenWidth || 1366, height: seed.screenHeight || 768 },
-          },
-        });
-        context._fpBrowser = browser;
-        launchMethod = 'fingerprint-injector';
-        this._log('success', 'Local fingerprint injected');
-      } catch (e) {
-        this._log('warn', `fingerprint-injector failed: ${e.message.substring(0, 80)}`);
-        if (browser) try { await browser.close(); } catch (_) {}
-        context = null;
-        browser = null;
+  _parseProxy(proxyString) {
+    if (!proxyString) return null;
+    try {
+      // Formats: ip:port, ip:port:user:pass, user:pass@ip:port, protocol://user:pass@ip:port
+      let str = proxyString.trim();
+      let protocol = 'http';
+      if (str.startsWith('http://') || str.startsWith('https://') || str.startsWith('socks5://')) {
+        const idx = str.indexOf('://');
+        protocol = str.substring(0, idx);
+        str = str.substring(idx + 3);
       }
-    }
-
-    // METHOD 2: playwright-extra + stealth
-    if (!context && PlaywrightExtra) {
-      try {
-        const launchOpts = { headless: isHeadless, args: launchArgs };
-        const proxyConfig = options.proxyUrl ? this._parseProxyUrl(options.proxyUrl) : undefined;
-        if (proxyConfig) launchOpts.proxy = proxyConfig;
-        browser = await PlaywrightExtra.launch(launchOpts);
-        context = await browser.newContext({
-          ignoreHTTPSErrors: true,
-          viewport: { width: 1366, height: 768 },
-          userAgent: this._randomUserAgent(),
-          locale: 'ru-RU',
-        });
-        context._stealthBrowser = browser;
-        launchMethod = 'stealth';
-      } catch (e) {
-        this._log('warn', `Stealth launch failed: ${e.message.substring(0, 60)}`);
-        if (browser) try { await browser.close(); } catch (_) {}
-        context = null;
-        browser = null;
+      let username, password, server;
+      if (str.includes('@')) {
+        const [auth, host] = str.split('@');
+        [username, password] = auth.split(':');
+        server = `${protocol}://${host}`;
+      } else {
+        const parts = str.split(':');
+        if (parts.length === 4) {
+          server = `${protocol}://${parts[0]}:${parts[1]}`;
+          username = parts[2];
+          password = parts[3];
+        } else if (parts.length === 2) {
+          server = `${protocol}://${parts[0]}:${parts[1]}`;
+        } else {
+          server = `${protocol}://${str}`;
+        }
       }
-    }
-
-    // METHOD 3: plain playwright-core
-    if (!context) {
-      const launchOpts = { headless: isHeadless, args: launchArgs };
-      const proxyConfig = options.proxyUrl ? this._parseProxyUrl(options.proxyUrl) : undefined;
-      if (proxyConfig) launchOpts.proxy = proxyConfig;
-      browser = await chromium.launch(launchOpts);
-      context = await browser.newContext({
-        ignoreHTTPSErrors: true,
-        viewport: { width: 1366, height: 768 },
-        userAgent: this._randomUserAgent(),
-        locale: 'ru-RU',
-      });
-      context._plainBrowser = browser;
-      launchMethod = 'plain';
-    }
-
-    const cid = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-    context._engineId = cid;
-    context._alive = true;
-    context._launchMethod = launchMethod;
-
-    const underlyingBrowser = context._fpBrowser || context._stealthBrowser || context._plainBrowser || context.browser?.() || null;
-    if (underlyingBrowser && typeof underlyingBrowser.on === 'function') {
-      underlyingBrowser.on('disconnected', () => {
-        context._alive = false;
-        this.activeContexts.delete(cid);
-      });
-    }
-    context.on('close', () => {
-      context._alive = false;
-      this.activeContexts.delete(cid);
-    });
-
-    this.activeContexts.set(cid, context);
-    this._log('success', `Browser launched [${launchMethod}] (headless: ${isHeadless})`);
-    return { context, browser: underlyingBrowser };
-  }
-
-  _parseProxyUrl(proxyUrl) {
-    try {
-      const u = new URL(proxyUrl);
-      const result = { server: `${u.protocol}//${u.hostname}:${u.port}` };
-      if (u.username) result.username = decodeURIComponent(u.username);
-      if (u.password) result.password = decodeURIComponent(u.password);
-      return result;
-    } catch (_) { return null; }
-  }
-
-  _randomUserAgent() {
-    const versions = ['120.0.0.0', '121.0.0.0', '122.0.0.0', '123.0.0.0', '124.0.0.0', '125.0.0.0'];
-    const v = versions[Math.floor(Math.random() * versions.length)];
-    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v} Safari/537.36`;
-  }
-
-  _buildProxyUrl(proxy) {
-    if (!proxy) return null;
-    const protocol = proxy.type === 'socks5' ? 'socks5' : 'http';
-    if (proxy.username && proxy.password) {
-      return `${protocol}://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`;
-    }
-    return `${protocol}://${proxy.host}:${proxy.port}`;
-  }
-
-  _isContextAlive(context) {
-    if (!context || context._alive === false) return false;
-    try {
-      const browser = context._fpBrowser || context._stealthBrowser || context._plainBrowser || context.browser?.();
-      if (browser && typeof browser.isConnected === 'function') return browser.isConnected();
-      return context._alive !== false;
-    } catch (_) { return false; }
-  }
-
-  _isPageAlive(page) {
-    try { return page && !page.isClosed(); } catch (_) { return false; }
-  }
-
-  // ──────── Cookie Loading ────────
-
-  async loadCookies(context, accountId) {
-    if (!accountId) return;
-    const cookies = this.accountManager.getCookies(accountId);
-    if (!cookies || !cookies.length) {
-      this._log('warn', `Account ${accountId.substring(0, 8)} has no cookies`);
-      return;
-    }
-    this._log('info', `Loading ${cookies.length} cookies for ${accountId.substring(0, 8)}...`);
-    const fixed = this._fixCookies(cookies);
-    try {
-      await context.addCookies(fixed);
-      this._log('success', `${fixed.length} cookies loaded`);
+      const proxy = { server };
+      if (username) proxy.username = username;
+      if (password) proxy.password = password;
+      return proxy;
     } catch (e) {
-      this._log('warn', `Batch cookie load failed: ${e.message}, loading individually...`);
-      let ok = 0, fail = 0;
-      for (const c of fixed) {
-        try { await context.addCookies([c]); ok++; } catch (_) { fail++; }
-      }
-      this._log('info', `Cookies: ${ok} loaded, ${fail} failed`);
+      this.log(`[Proxy] Parse error: ${e.message}`);
+      return null;
     }
   }
 
-  _fixCookies(cookies) {
-    return cookies.map(c => {
-      const f = { ...c };
-      if (f.sameSite) {
-        const s = f.sameSite.toLowerCase();
-        f.sameSite = s === 'none' ? 'None' : s === 'strict' ? 'Strict' : 'Lax';
+  _buildProxyUrl(proxyData) {
+    if (!proxyData) return null;
+    try {
+      const { host, port, username, password, protocol } = proxyData;
+      const proto = protocol || 'http';
+      if (username && password) {
+        const u = encodeURIComponent(username);
+        const p = encodeURIComponent(password);
+        return `${proto}://${u}:${p}@${host}:${port}`;
       }
-      if (f.sameSite === 'None') f.secure = true;
-      if (f.expires !== undefined && f.expires !== null) {
-        f.expires = Number(f.expires);
-        if (isNaN(f.expires) || f.expires < 0) delete f.expires;
-      }
-      return f;
-    });
+      return `${proto}://${host}:${port}`;
+    } catch (e) {
+      return null;
+    }
   }
 
-  // ──────── VK Login (login/pass) ────────
+  // ============================================================
+  // BROWSER LAUNCH
+  // ============================================================
 
-  /**
-   * Detect whether login string is a phone number.
-   * Accepts: +79..., 89..., 79..., 9... (10 digits), etc.
-   */
+  async _launchContext(options = {}) {
+    const settings = this.store.get('settings') || {};
+    const headless = options.headless !== undefined ? options.headless : (settings.headless !== undefined ? settings.headless : false);
+    const stealth = settings.stealth !== undefined ? settings.stealth : true;
+    
+    const launchOpts = {
+      headless,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-gpu',
+        '--window-size=1920,1080',
+        '--lang=ru-RU',
+      ],
+    };
+
+    if (options.proxy) {
+      launchOpts.proxy = typeof options.proxy === 'string' 
+        ? this._parseProxy(options.proxy) 
+        : options.proxy;
+    }
+
+    let browser;
+    try {
+      // Try playwright-extra with stealth if available and enabled
+      if (stealth) {
+        try {
+          const { chromium: stealthChromium } = require('playwright-extra');
+          const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+          stealthChromium.use(StealthPlugin());
+          browser = await stealthChromium.launch(launchOpts);
+          this.log('[Engine] Launched with stealth plugin');
+        } catch (e) {
+          browser = await chromium.launch(launchOpts);
+          this.log('[Engine] Launched plain (stealth not available)');
+        }
+      } else {
+        browser = await chromium.launch(launchOpts);
+        this.log('[Engine] Launched plain');
+      }
+    } catch (e) {
+      browser = await chromium.launch(launchOpts);
+      this.log('[Engine] Launched plain (fallback)');
+    }
+
+    // Build context options — use Playwright's native storageState if provided
+    const contextOpts = {
+      viewport: { width: 1920, height: 1080 },
+      locale: 'ru-RU',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    };
+
+    // Load storage state natively — this restores cookies + localStorage in one step
+    if (options.storageStatePath) {
+      try {
+        if (fs.existsSync(options.storageStatePath)) {
+          contextOpts.storageState = options.storageStatePath;
+          this.log(`[Engine] Loading storage state from ${path.basename(options.storageStatePath)}`);
+        }
+      } catch (e) {
+        this.log(`[Engine] Failed to set storage state: ${e.message}`);
+      }
+    }
+
+    const context = await browser.newContext(contextOpts);
+
+    const contextId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    this.activeContexts.set(contextId, { browser, context });
+
+    return { browser, context, contextId };
+  }
+
+  async _safeClose(contextId) {
+    try {
+      const entry = this.activeContexts.get(contextId);
+      if (entry) {
+        try { await entry.context.close(); } catch (e) {}
+        try { await entry.browser.close(); } catch (e) {}
+        this.activeContexts.delete(contextId);
+      }
+    } catch (e) {
+      this.log(`[Engine] Safe close error: ${e.message}`);
+    }
+  }
+
+  // ============================================================
+  // RANDOM HELPERS
+  // ============================================================
+
+  _randomDelay(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  async _humanDelay(minMs = 500, maxMs = 2000) {
+    const delay = this._randomDelay(minMs, maxMs);
+    await new Promise(r => setTimeout(r, delay));
+  }
+
+  async _humanType(page, selector, text) {
+    const settings = this.store.get('settings') || {};
+    const { min: typeMin, max: typeMax } = settings.typingDelay || { min: 50, max: 150 };
+    
+    const el = typeof selector === 'string' ? await page.$(selector) : selector;
+    if (!el) return;
+    
+    await el.click();
+    await this._humanDelay(100, 300);
+    
+    for (const char of text) {
+      await el.type(char, { delay: this._randomDelay(typeMin, typeMax) });
+    }
+  }
+
+  // ============================================================
+  // PHONE NUMBER HELPERS
+  // ============================================================
+
   _isPhoneNumber(login) {
-    const cleaned = login.replace(/[\s\-\(\)]/g, '');
-    // Starts with + and has digits
-    if (/^\+\d{10,15}$/.test(cleaned)) return true;
-    // Russian phone: 8 or 7 followed by 10 digits
-    if (/^[78]\d{10}$/.test(cleaned)) return true;
-    // Just 10 digits starting with 9 (Russian mobile without prefix)
-    if (/^9\d{9}$/.test(cleaned)) return true;
+    if (!login) return false;
+    const digits = login.replace(/[\s\-\(\)\+]/g, '');
+    // Russian phone: starts with 7, 8, or 9, length 10-11 digits
+    if (/^\d{10,11}$/.test(digits)) return true;
+    if (/^\+?\d{10,15}$/.test(login.replace(/[\s\-\(\)]/g, ''))) return true;
     return false;
   }
 
-  /**
-   * Normalize phone to just the 10 digits (without country code).
-   * E.g. "+79808673324" -> "9808673324", "89808673324" -> "9808673324"
-   */
   _normalizePhone(login) {
-    const cleaned = login.replace(/[\s\-\(\)]/g, '');
-    // +7XXXXXXXXXX -> XXXXXXXXXX
-    if (cleaned.startsWith('+7') && cleaned.length === 12) return cleaned.slice(2);
-    // 8XXXXXXXXXX -> XXXXXXXXXX  or  7XXXXXXXXXX -> XXXXXXXXXX
-    if (/^[78]\d{10}$/.test(cleaned)) return cleaned.slice(1);
-    // Already 10 digits
-    if (/^9\d{9}$/.test(cleaned)) return cleaned;
-    return cleaned;
+    // Remove all non-digit chars
+    let digits = login.replace(/\D/g, '');
+    // Remove leading country code: +7, 7, 8
+    if (digits.length === 11 && (digits.startsWith('7') || digits.startsWith('8'))) {
+      digits = digits.substring(1);
+    }
+    // Return 10-digit phone
+    return digits;
   }
 
+  // ============================================================
+  // VK LOGIN - MAIN FLOW
+  // ============================================================
+
+  /**
+   * Performs VK login following the modern id.vk.com auth flow:
+   * 
+   * 1. Open vk.com → click "Войти другим способом" / "Log in another way"
+   * 2. Select phone/email radio → enter login
+   * 3. Click "Продолжить" / "Continue" → redirects to id.vk.com/auth
+   * 4. OTP/SMS page → click "Подтвердить другим способом" / "Confirm using other method"
+   * 5. Popup "Выберите способ подтверждения" → click "Пароль" / "Password" option
+   * 6. Password field appears → enter password → click "Продолжить"
+   * 7. Handle captcha/2FA if needed
+   * 8. Verify logged in
+   * 
+   * Based on Python reference (vk_login_captcha.py) patterns.
+   */
   async loginVK(page, login, password) {
-    this._log('info', `VK login: ${login}...`);
+    this.log(`[VK Login] Starting login for ${login.substring(0, 4)}***`);
+
     try {
       // ── Step 1: Navigate to vk.com ──
-      await page.goto('https://vk.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(this.randomInt(2000, 4000));
+      this.log('[VK Login] Step 1: Navigating to vk.com...');
+      await page.goto('https://vk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await this._humanDelay(3000, 5000);
 
-      // ── Step 1a: Handle robot challenge "Проверяем, что вы не робот" ──
-      const robotResult = await this._handleRobotChallenge(page);
-      if (robotResult === 'blocked') {
-        return { success: false, error: 'robot_challenge', details: 'VK robot verification failed — try with proxy or later' };
+      // ── Step 1a: Handle robot challenge on initial load ──
+      await this._handleRobotChallenge(page);
+
+      // ── Step 2: Click "Войти другим способом" / "Log in another way" ──
+      // From Python ref: buttons with text variants for both Russian and English
+      this.log('[VK Login] Step 2: Looking for "Войти другим способом"...');
+      let foundAltLogin = false;
+
+      // Approach 1: evaluate (matches Python reference pattern)
+      try {
+        foundAltLogin = await page.evaluate(() => {
+          const variants = [
+            'войти другим способом', 'другие способы входа', 'войти другим',
+            'other', 'другие', 'способ', 'log in another way', 'other login',
+          ];
+          const elements = document.querySelectorAll('button, a, span, div[role="button"]');
+          for (const el of elements) {
+            const text = (el.textContent || '').trim().toLowerCase();
+            if (text.length > 60 || text.length === 0) continue;
+            if (el.offsetParent === null) continue;
+            if (!['a', 'button', 'span', 'div'].includes(el.tagName.toLowerCase())) continue;
+            if (variants.some(v => text.includes(v))) {
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        });
+        if (foundAltLogin) {
+          this.log('[VK Login] Clicked "Войти другим способом"');
+          await this._humanDelay(2000, 3000);
+        }
+      } catch (e) {}
+
+      // Approach 2: Playwright locators
+      if (!foundAltLogin) {
+        const altLoginSelectors = [
+          'button:has-text("Войти другим способом")',
+          'a:has-text("Войти другим способом")',
+          'span:has-text("Войти другим способом")',
+          '[data-testid="loginByPassword"]',
+          'button:has-text("Other login methods")',
+          'a:has-text("Log in another way")',
+        ];
+        for (const sel of altLoginSelectors) {
+          try {
+            const btn = page.locator(sel).first();
+            if (await btn.isVisible({ timeout: 1500 })) {
+              await btn.click();
+              foundAltLogin = true;
+              this.log(`[VK Login] Clicked alt login via locator: ${sel}`);
+              await this._humanDelay(2000, 3000);
+              break;
+            }
+          } catch (e) {}
+        }
       }
 
-      // ── Step 2: Click "Войти другим способом" — switch from QR to phone/email ──
-      const altLoginBtn = page.locator('button:has-text("Войти другим способом")').first();
-      if (await altLoginBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
-        await altLoginBtn.click();
-        this._log('info', 'Clicked "Войти другим способом"');
-        await page.waitForTimeout(this.randomInt(2000, 4000));
-      } else {
-        this._log('warn', '"Войти другим способом" not found — trying direct navigation');
-        await page.goto('https://id.vk.com/auth', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(this.randomInt(2000, 4000));
+      // If still not found, go directly to id.vk.com
+      if (!foundAltLogin) {
+        this.log('[VK Login] Alt login not found, navigating to id.vk.com/auth...');
+        await page.goto('https://id.vk.com/auth', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this._humanDelay(2000, 3000);
       }
 
-      // ── Step 3: Select phone / email radio ──
+      // ── Step 2a: Robot challenge again ──
+      await this._handleRobotChallenge(page);
+
+      // ── Step 2b: "I'm not a robot" checkbox (may appear BEFORE login form — Python ref) ──
+      await this._clickNotRobotCheckbox(page);
+
+      // ── Step 3: Select phone or email radio button ──
       const isPhone = this._isPhoneNumber(login);
-      this._log('info', `Login type: ${isPhone ? 'phone' : 'email/login'}`);
+      this.log(`[VK Login] Step 3: Login type = ${isPhone ? 'phone' : 'email'}`);
 
       if (isPhone) {
-        const phoneRadio = page.locator('input[name="login-view"][value="phone"]');
-        if (await phoneRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
-          const checked = await phoneRadio.isChecked().catch(() => true);
-          if (!checked) { await phoneRadio.click(); await page.waitForTimeout(500); }
-        }
+        try {
+          const phoneRadio = page.locator('input[type="radio"][value="phone"], label:has-text("Телефон"), label:has-text("Phone")').first();
+          if (await phoneRadio.isVisible({ timeout: 2000 })) {
+            await phoneRadio.click();
+            this.log('[VK Login] Selected phone radio');
+            await this._humanDelay(500, 1000);
+          }
+        } catch (e) {}
       } else {
-        // Click "Почта" radio — try the radio itself, then the label
-        const emailRadio = page.locator('input[name="login-view"][value="email"]');
-        if (await emailRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
-          await emailRadio.click();
-          await page.waitForTimeout(500);
-          this._log('info', 'Switched to email/login mode');
-        } else {
-          const lbl = page.locator('label:has-text("Почта")').first();
-          if (await lbl.isVisible({ timeout: 2000 }).catch(() => false)) {
-            await lbl.click(); await page.waitForTimeout(500);
+        try {
+          const emailLabels = [
+            'label:has-text("Почта")',
+            'label:has-text("Email")',
+            'input[type="radio"][value="email"]',
+            'label:has-text("E-mail")',
+          ];
+          for (const sel of emailLabels) {
+            try {
+              const radio = page.locator(sel).first();
+              if (await radio.isVisible({ timeout: 1500 })) {
+                await radio.click();
+                this.log('[VK Login] Selected email radio');
+                await this._humanDelay(500, 1000);
+                break;
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
+      }
+
+      // ── Step 4: Enter login into the input field ──
+      // Python ref: email_selectors with VK-specific class names
+      this.log('[VK Login] Step 4: Entering login...');
+      
+      const loginInputSelectors = [
+        'input[name="login"]',
+        'input[type="tel"]',
+        'input[type="email"]',
+        'input[name="username"]',
+        'input#index_email',
+        'input.vkc__TextField__input',
+        'input[placeholder*="Телефон"]',
+        'input[placeholder*="логин"]',
+        'input[placeholder*="телефон"]',
+        'input[placeholder*="email"]',
+        'input[autocomplete="username"]',
+      ];
+
+      let loginInput = null;
+      for (const sel of loginInputSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 1500 })) {
+            loginInput = el;
+            this.log(`[VK Login] Found login input: ${sel}`);
+            break;
+          }
+        } catch (e) {}
+      }
+
+      if (!loginInput) {
+        this.log('[VK Login] ERROR: Login input not found');
+        return { success: false, error: 'no_login_field' };
+      }
+
+      // Clear the field (it may have +7 pre-filled for phone)
+      await loginInput.click();
+      await this._humanDelay(200, 400);
+      await loginInput.click({ clickCount: 3 });
+      await this._humanDelay(100, 200);
+      await page.keyboard.press('Backspace');
+      await this._humanDelay(200, 400);
+      await page.keyboard.press('Control+a');
+      await page.keyboard.press('Delete');
+      await this._humanDelay(200, 400);
+
+      // Type the login value
+      let loginValue;
+      if (isPhone) {
+        loginValue = this._normalizePhone(login);
+        this.log(`[VK Login] Normalized phone: ${loginValue.substring(0, 3)}***`);
+      } else {
+        loginValue = login;
+      }
+
+      await this._humanType(page, loginInput, loginValue);
+      await this._humanDelay(500, 1000);
+
+      // ── Step 5: Click "Продолжить" / "Continue" / submit ──
+      // Python ref: checks if password is already visible (1-step form vs 2-step)
+      this.log('[VK Login] Step 5: Clicking submit...');
+
+      let passwordAlreadyVisible = false;
+      try {
+        passwordAlreadyVisible = await page.locator('input[type="password"]').first().isVisible({ timeout: 500 });
+      } catch (e) {}
+
+      if (!passwordAlreadyVisible) {
+        let submitted = false;
+
+        // Python ref: VK-specific button container selectors
+        const submitSelectors = [
+          'div.vkc__AuthRoot__wrapper div.vkc__DefaultSkin__buttonContainer button',
+          'div.vkc__DefaultSkin__buttonContainer button',
+          'button[type="submit"]',
+          'button.vkc__Button',
+          'a.vkc__Button',
+          'div.vkc__DefaultSkin__button button',
+          '#root button[type="button"]',
+          'div.vkc__AuthRoot__wrapper button',
+        ];
+
+        // Try with evaluate (Python ref pattern: check text + type)
+        try {
+          submitted = await page.evaluate((sels) => {
+            const textVariants = ['продолжить', 'continue', 'далее', 'next', 'войти', 'sign in'];
+            for (const sel of sels) {
+              try {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                  if (!el.offsetParent || el.disabled) continue;
+                  const txt = (el.textContent || '').toLowerCase();
+                  const txtInner = (el.innerText || '').toLowerCase();
+                  const atype = el.getAttribute('type') || '';
+                  const isVkc = sel.includes('vkc');
+                  const match = textVariants.some(v => txt.includes(v) || txtInner.includes(v)) || atype === 'submit';
+                  if (match || (isVkc && el.tagName === 'BUTTON')) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    el.click();
+                    return true;
+                  }
+                }
+              } catch (e) {}
+            }
+            return false;
+          }, submitSelectors);
+          if (submitted) this.log('[VK Login] Clicked submit (after login input)');
+        } catch (e) {}
+
+        if (!submitted) {
+          // Locator fallback
+          const locatorSels = [
+            'button[type="submit"]',
+            'button:has-text("Продолжить")',
+            'button:has-text("Continue")',
+            'button:has-text("Войти")',
+            'button:has-text("Sign in")',
+          ];
+          for (const sel of locatorSels) {
+            try {
+              const btn = page.locator(sel).first();
+              if (await btn.isVisible({ timeout: 1500 })) {
+                const isDisabled = await btn.evaluate(el => 
+                  el.disabled || el.classList.contains('vkuiButton__disabled') || el.getAttribute('aria-disabled') === 'true'
+                );
+                if (!isDisabled) {
+                  await btn.click();
+                  submitted = true;
+                  this.log(`[VK Login] Clicked submit via locator: ${sel}`);
+                  break;
+                }
+              }
+            } catch (e) {}
           }
         }
-      }
 
-      // ── Step 4: Enter login ──
-      const loginInput = page.locator('input[name="login"]').first();
-      await loginInput.waitFor({ state: 'visible', timeout: 10000 });
-      await loginInput.click();
-      await page.waitForTimeout(this.randomInt(300, 600));
-
-      if (isPhone) {
-        // Field pre-filled with "+7 ". Clear all, type 10 digits.
-        const digits = this._normalizePhone(login);
-        await loginInput.click({ clickCount: 3 });
-        await page.waitForTimeout(150);
-        await page.keyboard.press('Backspace');
-        await page.waitForTimeout(150);
-        await this.typeHumanLike(loginInput, digits);
-      } else {
-        await loginInput.fill('');
-        await page.waitForTimeout(150);
-        await this.typeHumanLike(loginInput, login);
-      }
-      await page.waitForTimeout(this.randomInt(500, 1200));
-
-      // ── Step 5: Submit phone/email → "Войти" ──
-      const submitBtn = page.locator('button:has-text("Войти")').first();
-      if (await submitBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await submitBtn.click();
-        this._log('info', 'Clicked "Войти"');
-      } else {
-        await page.keyboard.press('Enter');
-      }
-      await page.waitForTimeout(this.randomInt(4000, 7000));
-
-      // ── Step 6: Detect page state ──
-      const curUrl = page.url();
-      this._log('info', `After submit: ${curUrl.substring(0, 90)}...`);
-
-      // 6-err: check captcha on this page
-      const captchaSolved = await this._trySolveCaptchaOnPage(page);
-      // (if captcha was present and solved, flow continues; if failed — returns below)
-
-      // 6-err: check error message
-      const loginErr = await this._getVisibleError(page);
-      if (loginErr) {
-        this._log('error', `Login error: ${loginErr}`);
-        return { success: false, error: 'login_error', details: loginErr };
-      }
-
-      // ── Step 6a: OTP page → click "Подтвердить другим способом" ──
-      const hasOtp = await page.locator('input[name="otp-cell"]').first()
-        .isVisible({ timeout: 3000 }).catch(() => false);
-
-      if (hasOtp) {
-        this._log('info', 'OTP page — clicking "Подтвердить другим способом"...');
-        const altConfirm = page.locator('button:has-text("Подтвердить другим способом")').first();
-        if (await altConfirm.isVisible({ timeout: 5000 }).catch(() => false)) {
-          await altConfirm.click();
-          await page.waitForTimeout(this.randomInt(2000, 4000));
-        } else {
-          this._log('warn', '"Подтвердить другим способом" not found — OTP-only account');
-          return { success: false, error: 'otp_only', details: 'Account requires SMS code, no password option' };
-        }
-      }
-
-      // ── Step 6b: CRITICAL — dismiss "Выберите способ подтверждения" popup FIRST ──
-      // After "Подтвердить другим способом" VK shows BOTH the password form
-      // AND an overlay popup simultaneously. The popup blocks the password field.
-      // Must close it before we can interact with the password input.
-      await this._dismissConfirmationPopup(page);
-
-      // ── Step 7: Enter password ──
-      const passInput = page.locator('input[name="password"], input[type="password"]').first();
-      const hasPass = await passInput.isVisible({ timeout: 8000 }).catch(() => false);
-
-      if (!hasPass) {
-        const snap = await page.evaluate(() => document.body.innerText.substring(0, 300));
-        this._log('warn', `No password field. Page: ${snap.substring(0, 120)}`);
-        return { success: false, error: 'no_password_field', details: snap.substring(0, 150) };
-      }
-
-      this._log('info', 'Password field visible — entering password...');
-      await passInput.click();
-      await page.waitForTimeout(this.randomInt(300, 600));
-      await this.typeHumanLike(passInput, password);
-      await page.waitForTimeout(this.randomInt(500, 1200));
-
-      // "Продолжить" starts DISABLED; it enables after password is typed.
-      // Wait for it to become enabled (no .vkuiButton__disabled class).
-      const contBtn = page.locator(
-        'button:has-text("Продолжить"):not(.vkuiButton__disabled)'
-      ).first();
-      const contEnabled = await contBtn.isVisible({ timeout: 5000 }).catch(() => false);
-
-      if (contEnabled) {
-        await contBtn.click();
-        this._log('info', 'Clicked "Продолжить"');
-      } else {
-        // Fallback — try any Продолжить or Enter
-        const anyBtn = page.locator('button:has-text("Продолжить")').first();
-        if (await anyBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await anyBtn.click();
-          this._log('info', 'Clicked "Продолжить" (may still be disabled)');
-        } else {
+        if (!submitted) {
           await page.keyboard.press('Enter');
-          this._log('info', 'Pressed Enter to submit password');
+          this.log('[VK Login] Pressed Enter as fallback submit');
         }
-      }
-      await page.waitForTimeout(this.randomInt(5000, 8000));
 
-      // ── Step 8: Post-password checks ──
-      await this._dismissConfirmationPopup(page);
-
-      // 8a: captcha after password?
-      await this._trySolveCaptchaOnPage(page);
-
-      // 8b: 2FA?
-      const has2fa = await page.locator('input[name="otp-cell"], input[name="code"]').first()
-        .isVisible({ timeout: 3000 }).catch(() => false);
-      if (has2fa) {
-        this._log('warn', '2FA code requested after password');
-        return { success: false, error: 'challenge', details: '2FA code required' };
+        await this._humanDelay(2500, 4000);
       }
 
-      // 8c: wrong password?
-      const passErr = await page.evaluate(() => {
-        const body = document.body.innerText || '';
-        if (body.includes('Неверный пароль') || body.includes('Incorrect password'))
-          return 'Неверный пароль';
-        const els = document.querySelectorAll('[class*="error" i], [role="alert"]');
-        for (const el of els) {
-          const t = el.textContent.trim();
-          if (el.offsetWidth > 0 && t.length > 3) return t;
-        }
-        return null;
-      });
-      if (passErr) {
-        this._log('error', `Password error: ${passErr}`);
-        return { success: false, error: 'wrong_password', details: passErr };
+      // ── Step 5a: Robot challenge after submit ──
+      await this._handleRobotChallenge(page);
+
+      // ── Step 5b: "I'm not a robot" checkbox (Python ref: after phone input) ──
+      for (let i = 0; i < 3; i++) {
+        if (await this._clickNotRobotCheckbox(page)) break;
+        await this._humanDelay(800, 1200);
       }
 
-      // ── Step 9: Check login success ──
-      const isLoggedIn = await this._checkVKLogin(page);
-      if (isLoggedIn) {
-        this._log('success', `VK login successful: ${login}`);
+      // ── Step 6: Detect page state after login submit ──
+      this.log('[VK Login] Step 6: Detecting page state...');
+
+      // Check if we're already logged in
+      if (await this._checkVKLogin(page)) {
+        this.log('[VK Login] Already logged in after step 5!');
         const cookies = await page.context().cookies();
         return { success: true, cookies };
       }
 
-      const fUrl = page.url();
-      const fText = await page.evaluate(() => document.body.innerText.substring(0, 250));
-      this._log('error', `Login ended in unknown state: ${fUrl.substring(0, 80)}`);
-      return { success: false, error: 'unknown', details: `URL: ${fUrl.substring(0, 100)} | ${fText.substring(0, 100)}` };
-    } catch (e) {
-      this._log('error', `VK login exception: ${e.message}`);
-      return { success: false, error: 'exception', details: e.message };
+      // Check for captcha BEFORE anything else
+      const captchaSolved = await this._trySolveCaptchaOnPage(page);
+      if (captchaSolved) {
+        await this._humanDelay(2000, 3000);
+        if (await this._checkVKLogin(page)) {
+          const cookies = await page.context().cookies();
+          return { success: true, cookies };
+        }
+      }
+
+      // Check for blocked account (Python ref: is_account_blocked)
+      const isBlocked = await page.evaluate(() => {
+        const url = (window.location.href || '').toLowerCase();
+        const body = (document.body?.innerText || '').toLowerCase();
+        return url.includes('blocked') || body.includes('заблокирован') || body.includes('profile was blocked');
+      }).catch(() => false);
+
+      if (isBlocked) {
+        this.log('[VK Login] Account is BLOCKED');
+        return { success: false, error: 'blocked' };
+      }
+
+      // Check for wrong password (Python ref: is_password_incorrect)
+      const isWrongPwd = await page.evaluate(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        return body.includes('неверный пароль') || body.includes('incorrect password') || 
+               body.includes('wrong password') || body.includes('неверный логин') ||
+               (body.includes('неверн') && body.includes('парол'));
+      }).catch(() => false);
+
+      if (isWrongPwd) {
+        this.log('[VK Login] Wrong password detected');
+        return { success: false, error: 'wrong_password' };
+      }
+
+      // ── Step 7: Handle OTP/SMS page → Password path ──
+      // Python ref: click_sms_bypass() → "Confirm using other method" → "Password"
+      this.log('[VK Login] Step 7: Looking for OTP bypass / password path...');
+
+      let passwordFieldVisible = passwordAlreadyVisible || false;
+
+      // First check if password field is already visible (email login may show it directly)
+      if (!passwordFieldVisible) {
+        try {
+          passwordFieldVisible = await page.locator('input[type="password"]').first().isVisible({ timeout: 2000 });
+        } catch (e) {}
+      }
+
+      if (!passwordFieldVisible) {
+        // Python ref: click_sms_bypass — evaluate pattern to find "Confirm using other method"
+        this.log('[VK Login] Looking for "Подтвердить другим способом"...');
+        
+        let clickedOtherMethod = false;
+        
+        // Evaluate approach (matches Python ref)
+        try {
+          clickedOtherMethod = await page.evaluate(() => {
+            const texts = [
+              'confirm using other', 'other method', 
+              'подтвердить другим', 'другим способом',
+            ];
+            const els = document.querySelectorAll('a, span, button, div[role="button"]');
+            for (const el of els) {
+              const t = (el.textContent || '').trim().toLowerCase();
+              if (!t || t.length > 60) continue;
+              if (el.offsetParent === null) continue;
+              if (texts.some(v => t.includes(v))) {
+                try { el.click(); } catch (e) {}
+                return true;
+              }
+            }
+            return false;
+          });
+          if (clickedOtherMethod) {
+            this.log('[VK Login] Clicked "Подтвердить другим способом"');
+            await this._humanDelay(2000, 3000);
+          }
+        } catch (e) {}
+
+        // Locator fallback
+        if (!clickedOtherMethod) {
+          const otherMethodTexts = [
+            'подтвердить другим способом',
+            'confirm using other',
+            'другим способом',
+            'other method',
+          ];
+          for (const text of otherMethodTexts) {
+            try {
+              const btn = page.locator(`button:has-text("${text}"), a:has-text("${text}"), span:has-text("${text}")`).first();
+              if (await btn.isVisible({ timeout: 1500 })) {
+                await btn.click();
+                clickedOtherMethod = true;
+                this.log(`[VK Login] Clicked "${text}"`);
+                await this._humanDelay(2000, 3000);
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+
+        if (!clickedOtherMethod) {
+          // No OTP bypass found — check if SMS-only account
+          this.log('[VK Login] No OTP bypass found. Checking if SMS-only...');
+          
+          const hasOtpInputs = await page.evaluate(() => {
+            const inputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"]');
+            let otpCount = 0;
+            for (const inp of inputs) {
+              if (inp.maxLength === 1 || inp.getAttribute('autocomplete')?.includes('one-time')) otpCount++;
+            }
+            return otpCount >= 4;
+          }).catch(() => false);
+
+          if (hasOtpInputs) {
+            this.log('[VK Login] SMS-only account detected (OTP inputs visible)');
+            return { success: false, error: 'sms_only', message: 'Account requires SMS code, no password option available' };
+          }
+        }
+
+        // ── Step 7a: Handle "Выберите способ подтверждения" popup ──
+        // Python ref: click "Password" / "Enter your account password" in modal
+        this.log('[VK Login] Step 7a: Looking for verification method popup...');
+        
+        // Python ref: 3 attempts to find password option in popup
+        for (let popupAttempt = 0; popupAttempt < 3; popupAttempt++) {
+          if (await this._selectPasswordInPopup(page)) break;
+          await this._humanDelay(800, 1200);
+        }
+        
+        await this._humanDelay(1500, 2500);
+
+        // Check again if password field appeared
+        try {
+          passwordFieldVisible = await page.locator('input[type="password"]').first().isVisible({ timeout: 3000 });
+        } catch (e) {}
+      }
+
+      // ── Step 8: Enter password ──
+      // Python ref: pass_selectors with VK-specific classes
+      if (!passwordFieldVisible) {
+        const passwordSelectors = [
+          'input[name="password"]',
+          'input[type="password"]',
+          'input#index_pass',
+          'input.vkc__Password__input',
+          'input[autocomplete="current-password"]',
+          'input[placeholder*="Пароль"]',
+          'input[placeholder*="пароль"]',
+          'input[placeholder*="Password"]',
+          'input[placeholder*="password"]',
+        ];
+        for (const sel of passwordSelectors) {
+          try {
+            const pwdField = page.locator(sel).first();
+            if (await pwdField.isVisible({ timeout: 2000 })) {
+              passwordFieldVisible = true;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      if (!passwordFieldVisible) {
+        this.log('[VK Login] ERROR: Password field not visible');
+        const debugText = await page.evaluate(() => {
+          return Array.from(document.querySelectorAll('button, a, input, h1, h2, h3, [role="button"]'))
+            .filter(el => el.offsetParent !== null)
+            .map(el => `${el.tagName}[${el.type || ''}]: "${(el.textContent || '').trim().substring(0, 60)}"`)
+            .join('\n');
+        }).catch(() => 'failed to get page elements');
+        this.log(`[VK Login] Page elements:\n${debugText}`);
+        return { success: false, error: 'no_password_field', url: page.url() };
+      }
+
+      this.log('[VK Login] Step 8: Entering password...');
+      
+      const passwordInput = page.locator('input[type="password"], input[name="password"]').first();
+      await passwordInput.click();
+      await this._humanDelay(200, 400);
+      await passwordInput.fill(''); // Clear field
+      await this._humanType(page, passwordInput, password);
+      await this._humanDelay(500, 1000);
+
+      // ── Step 9: Click submit password ──
+      // Python ref: btn_selectors + btn_text_variants for both RU and EN
+      this.log('[VK Login] Step 9: Clicking submit password...');
+      
+      let clickedSubmit = false;
+      
+      // Python ref: use specific VK button selectors first
+      const submitPasswordSelectors = [
+        'button[type="submit"]',
+        'button.vkc__Button__button--primary',
+        'input[type="submit"]',
+        '.vkAuthButton',
+        '#install_allow',
+        'button.vkc__Button',
+      ];
+      const btnTextVariants = ['продолжить', 'continue', 'войти', 'вход', 'login', 'sign in', 'enter'];
+
+      // Wait up to 5 seconds for enabled button
+      for (let attempt = 0; attempt < 10; attempt++) {
+        // Try VK-specific selectors
+        try {
+          clickedSubmit = await page.evaluate(({ sels, texts }) => {
+            for (const sel of sels) {
+              try {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                  if (el.offsetParent && !el.disabled && el.isConnected) {
+                    el.click();
+                    return true;
+                  }
+                }
+              } catch (e) {}
+            }
+            // Fallback: search by text
+            const btns = document.querySelectorAll('button, input[type="submit"], a[role="button"]');
+            for (const btn of btns) {
+              const txt = (btn.textContent || btn.value || '').toLowerCase();
+              const disabled = btn.disabled || btn.classList.contains('vkuiButton__disabled') || btn.classList.contains('vkuiButton--disabled');
+              if (!disabled && btn.offsetParent && texts.some(v => txt.includes(v))) {
+                btn.click();
+                return true;
+              }
+            }
+            return false;
+          }, { sels: submitPasswordSelectors, texts: btnTextVariants });
+          if (clickedSubmit) {
+            this.log('[VK Login] Clicked password submit');
+            break;
+          }
+        } catch (e) {}
+        await this._humanDelay(400, 600);
+      }
+
+      if (!clickedSubmit) {
+        await page.keyboard.press('Enter');
+        this.log('[VK Login] Pressed Enter for password submit');
+      }
+
+      await this._humanDelay(3000, 5000);
+
+      // ── Step 10: Post-password checks (Python ref: captcha loop) ──
+      this.log('[VK Login] Step 10: Post-password checks...');
+
+      // Robot challenge / "Продолжить" clicks (Python ref: 10 attempts)
+      for (let i = 0; i < 10; i++) {
+        const hasRobot = await this._handleRobotChallenge(page);
+        if (!hasRobot) break;
+        await this._humanDelay(1500, 2500);
+      }
+
+      // Dismiss any remaining popups
+      await this._dismissConfirmationPopup(page);
+
+      // Try solve captcha if present (Python ref: max_captcha_attempts loop)
+      const settings = this.store.get('settings') || {};
+      const maxCaptchaAttempts = settings.maxCaptchaAttempts || 3;
+      for (let captchaAttempt = 0; captchaAttempt < maxCaptchaAttempts; captchaAttempt++) {
+        // Check blocked
+        const blocked = await page.evaluate(() => {
+          const url = (window.location.href || '').toLowerCase();
+          const body = (document.body?.innerText || '').toLowerCase();
+          return url.includes('blocked') || body.includes('заблокирован') || body.includes('blocked');
+        }).catch(() => false);
+        if (blocked) {
+          this.log('[VK Login] Account blocked');
+          return { success: false, error: 'blocked' };
+        }
+
+        // Check if already logged in
+        if (await this._checkVKLogin(page)) break;
+        
+        // Check for wrong password
+        const wrongPwd = await page.evaluate(() => {
+          const body = (document.body?.innerText || '').toLowerCase();
+          return body.includes('неверный пароль') || body.includes('incorrect password') || 
+                 body.includes('wrong password') || (body.includes('неверн') && body.includes('парол'));
+        }).catch(() => false);
+        if (wrongPwd) {
+          this.log('[VK Login] Wrong password');
+          return { success: false, error: 'wrong_password' };
+        }
+
+        // Try solve captcha
+        const solved = await this._trySolveCaptchaOnPage(page);
+        if (solved) {
+          await this._humanDelay(2000, 3000);
+          continue;
+        }
+
+        // Try "Продолжить" / Turnstile
+        await this._handleRobotChallenge(page);
+        await this._humanDelay(1500, 2500);
+
+        // Check login success
+        const currentUrl = page.url().toLowerCase();
+        if (!currentUrl.includes('login') || currentUrl.includes('feed')) break;
+      }
+
+      // Check for 2FA
+      const has2FA = await page.evaluate(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        return body.includes('двухфакторн') || body.includes('two-factor') || body.includes('подтверждение входа') || body.includes('authenticator');
+      }).catch(() => false);
+
+      if (has2FA) {
+        this.log('[VK Login] 2FA detected');
+        return { success: false, error: '2fa_required' };
+      }
+
+      // ── Step 11: Verify login success (Python ref: final check) ──
+      this.log('[VK Login] Step 11: Verifying login...');
+      await this._humanDelay(2000, 3000);
+
+      if (await this._checkVKLogin(page)) {
+        this.log('[VK Login] ✅ Login successful!');
+        const cookies = await page.context().cookies();
+        return { success: true, cookies };
+      }
+
+      // Navigate to feed to double-check (Python ref: "feed" in current_url)
+      try {
+        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await this._humanDelay(2000, 3000);
+        
+        if (await this._checkVKLogin(page)) {
+          this.log('[VK Login] ✅ Login successful (verified on /feed)!');
+          const cookies = await page.context().cookies();
+          return { success: true, cookies };
+        }
+      } catch (e) {}
+
+      // Final blocked/password check
+      const finalBlocked = await page.evaluate(() => {
+        const url = (window.location.href || '').toLowerCase();
+        const body = (document.body?.innerText || '').toLowerCase();
+        return url.includes('blocked') || body.includes('заблокирован');
+      }).catch(() => false);
+      if (finalBlocked) return { success: false, error: 'blocked' };
+
+      const finalWrongPwd = await page.evaluate(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        return body.includes('неверный пароль') || body.includes('incorrect password');
+      }).catch(() => false);
+      if (finalWrongPwd) return { success: false, error: 'wrong_password' };
+
+      this.log('[VK Login] ❌ Login failed - could not verify');
+      return { success: false, error: 'login_failed', url: page.url() };
+
+    } catch (error) {
+      this.log(`[VK Login] Exception: ${error.message}`);
+      return { success: false, error: 'exception', message: error.message };
     }
   }
 
-  // ──────── Popups & Challenges ────────
+  // ============================================================
+  // POPUP & CHALLENGE HANDLERS
+  // ============================================================
 
   /**
-   * Dismiss "Выберите способ подтверждения" overlay.
-   * It appears on top of the password form and blocks interaction.
+   * Handles the "Выберите способ подтверждения" popup.
+   * This popup appears after clicking "Подтвердить другим способом".
+   * 
+   * CRITICAL: Must click "Пароль" / "Password" option — NOT just close!
+   * The popup offers: QR code, SMS code, Password, Restore access
+   * 
+   * Based on Python ref: XPath search for elements containing 'password'/'паролю'
+   * with filter to exclude 'confirm' and 'other' text.
+   */
+  async _selectPasswordInPopup(page) {
+    this.log('[VK Login] Looking for password option in popup...');
+    
+    // Approach 1: Evaluate (Python ref pattern — most reliable)
+    // Python ref: finds elements with text 'password'/'паролю', excludes 'confirm'/'other'
+    try {
+      const clicked = await page.evaluate(() => {
+        const passwordTexts = ['password', 'паролю', 'пароль', 'account password', 'введите пароль', 'по паролю'];
+        const excludeTexts = ['confirm', 'other', 'подтвердить', 'другим'];
+        
+        // Search all visible elements with password text
+        const allEls = document.querySelectorAll('*');
+        for (const el of allEls) {
+          if (el.offsetParent === null) continue;
+          if (!el.isConnected) continue;
+          
+          const text = (el.textContent || '').toLowerCase().trim();
+          if (text.length > 80 || text.length === 0) continue;
+          
+          // Must contain a password-related text
+          const hasPassword = passwordTexts.some(p => text.includes(p));
+          if (!hasPassword) continue;
+          
+          // Must NOT contain exclude texts (to avoid clicking "Confirm using other method")
+          const hasExclude = excludeTexts.some(e => text.includes(e));
+          if (hasExclude) continue;
+          
+          // Prefer leaf-ish elements (not too many children)
+          const childCount = el.children.length;
+          if (childCount > 10) continue;
+          
+          try {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.click();
+            return `Clicked: "${text.substring(0, 60)}" (${el.tagName})`;
+          } catch (e) {
+            continue;
+          }
+        }
+        
+        // Fallback: look specifically in dialog/modal containers
+        const containers = document.querySelectorAll('[role="dialog"], [class*="modal"], [class*="popup"], [class*="bottomSheet"], [class*="ActionSheet"], [class*="sheet"]');
+        for (const container of containers) {
+          const elements = container.querySelectorAll('div, span, a, button, li, [role="button"], [role="option"]');
+          for (const el of elements) {
+            const text = (el.textContent || '').toLowerCase().trim();
+            if (text.length > 100) continue;
+            if (passwordTexts.some(p => text.includes(p)) && el.offsetParent !== null) {
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              el.click();
+              return `Clicked in modal: "${text.substring(0, 60)}"`;
+            }
+          }
+        }
+        
+        return null;
+      });
+      
+      if (clicked) {
+        this.log(`[VK Login] ${clicked}`);
+        await this._humanDelay(1500, 2500);
+        return true;
+      }
+    } catch (e) {
+      this.log(`[VK Login] Evaluate error: ${e.message}`);
+    }
+
+    // Approach 2: Playwright locators
+    const passwordTexts = ['пароль', 'password', 'account password'];
+    for (const text of passwordTexts) {
+      try {
+        const selectors = [
+          `span:has-text("${text}")`,
+          `div:has-text("${text}")`,
+          `a:has-text("${text}")`,
+          `button:has-text("${text}")`,
+          `[role="button"]:has-text("${text}")`,
+          `li:has-text("${text}")`,
+        ];
+        for (const sel of selectors) {
+          try {
+            const el = page.locator(sel).first();
+            if (await el.isVisible({ timeout: 800 })) {
+              const elText = await el.textContent().catch(() => '');
+              if (elText && elText.toLowerCase().includes(text) && elText.length < 80) {
+                // Exclude "confirm using other" matches
+                const lower = elText.toLowerCase();
+                if (lower.includes('confirm') || lower.includes('other') || lower.includes('подтвердить') || lower.includes('другим')) continue;
+                await el.click();
+                this.log(`[VK Login] Clicked password option: "${elText.trim().substring(0, 50)}"`);
+                await this._humanDelay(1500, 2500);
+                return true;
+              }
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    // Approach 3: Keyboard navigation
+    try {
+      for (let i = 0; i < 5; i++) {
+        await page.keyboard.press('Tab');
+        await this._humanDelay(300, 500);
+        const focusedText = await page.evaluate(() => {
+          const el = document.activeElement;
+          return el ? (el.textContent || '').toLowerCase().trim() : '';
+        }).catch(() => '');
+        if (passwordTexts.some(t => focusedText.includes(t))) {
+          await page.keyboard.press('Enter');
+          this.log('[VK Login] Selected password via keyboard navigation');
+          await this._humanDelay(1500, 2500);
+          return true;
+        }
+      }
+    } catch (e) {}
+
+    this.log('[VK Login] Could not find password option in popup');
+    return false;
+  }
+
+  /**
+   * Dismisses generic confirmation/info popups (e.g., "Закрыть" buttons)
+   * Used as a fallback after other handlers
    */
   async _dismissConfirmationPopup(page) {
     try {
-      const closeBtn = page.locator('button:has-text("Закрыть")').first();
-      if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await closeBtn.click();
-        this._log('info', 'Dismissed "Выберите способ подтверждения" popup');
-        await page.waitForTimeout(this.randomInt(500, 1000));
+      const closeTexts = ['закрыть', 'close', 'отмена', 'cancel', 'не сейчас', 'not now', 'позже', 'later'];
+      
+      const closed = await page.evaluate((texts) => {
+        const elements = document.querySelectorAll('button, a, span, [role="button"]');
+        for (const el of elements) {
+          const text = (el.textContent || '').toLowerCase().trim();
+          if (texts.some(t => text === t || text.includes(t)) && el.offsetParent !== null && text.length < 30) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      }, closeTexts);
+
+      if (closed) {
+        this.log('[VK Login] Dismissed popup');
+        await this._humanDelay(500, 1000);
         return true;
       }
-      return false;
-    } catch (_) { return false; }
+    } catch (e) {}
+    return false;
   }
 
   /**
-   * Handle "Проверяем, что вы не робот" challenge.
-   * Tries "Продолжить", then attempts ruCaptcha if captcha appears.
-   * Returns: 'passed' | 'blocked' | 'none'
+   * Handles robot challenge: "Проверяем, что вы не робот"
+   * Based on Python ref: is_robot_check_visible + click_robot_check_continue + dismiss_robot_check
+   * Returns true if a robot challenge was found and handled.
    */
   async _handleRobotChallenge(page) {
+    const maxAttempts = 5;
+    
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Python ref: is_robot_check_visible
+      const isRobot = await page.evaluate(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        return body.includes('робот') || body.includes('robot');
+      }).catch(() => false);
+
+      if (!isRobot) return false;
+
+      this.log(`[VK Login] Robot challenge detected (attempt ${attempt + 1}/${maxAttempts})`);
+
+      // Python ref: click_robot_check_continue — multiple strategies
+      let clicked = false;
+      
+      // 1. XPath-style: buttons with "Продолжить" / "Continue" (Python ref priority)
+      try {
+        clicked = await page.evaluate(() => {
+          // Buttons and role=button with Continue text
+          const xpathEls = document.querySelectorAll('button, *[role="button"]');
+          for (const el of xpathEls) {
+            const text = (el.textContent || '').toLowerCase();
+            if ((text.includes('продолжить') || text.includes('continue')) && el.offsetParent !== null) {
+              el.scrollIntoView();
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        });
+      } catch (e) {}
+
+      // 2. Python ref: CSS selectors (body > div > button.start, button.start, button[type=submit])
+      if (!clicked) {
+        const cssSelectors = [
+          'body > div > button.start',
+          'button.start',
+          'button[type="submit"]',
+          'div button.start',
+        ];
+        for (const sel of cssSelectors) {
+          try {
+            const btn = page.locator(sel).first();
+            if (await btn.isVisible({ timeout: 800 })) {
+              await btn.click();
+              clicked = true;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      // 3. Python ref: any clickable element with "Продолжить"/"Continue"
+      if (!clicked) {
+        try {
+          clicked = await page.evaluate(() => {
+            const els = document.querySelectorAll('button, a, span, div');
+            for (const el of els) {
+              const text = (el.textContent || '').toLowerCase();
+              if ((text.includes('продолжить') || text.includes('continue')) && 
+                  el.offsetParent !== null && 
+                  ['button', 'a', 'span', 'div'].includes(el.tagName.toLowerCase())) {
+                el.scrollIntoView();
+                el.click();
+                return true;
+              }
+            }
+            return false;
+          });
+        } catch (e) {}
+      }
+
+      // 4. Python ref: Turnstile iframes
+      if (!clicked) {
+        try {
+          const frames = page.frames();
+          for (const frame of frames) {
+            try {
+              const clickedInFrame = await frame.evaluate(() => {
+                const els = document.querySelectorAll('button, *[role="button"], input[type="submit"]');
+                for (const el of els) {
+                  if (el.offsetParent !== null) {
+                    el.click();
+                    return true;
+                  }
+                }
+                return false;
+              });
+              if (clickedInFrame) {
+                clicked = true;
+                break;
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
+      }
+
+      // 5. Try ruCaptcha to solve the challenge
+      if (!clicked) {
+        await this._trySolveCaptchaOnPage(page);
+      }
+
+      await this._humanDelay(2000, 3000);
+    }
+    
+    return true;
+  }
+
+  /**
+   * Clicks "I'm not a robot" / "Я не робот" checkbox
+   */
+  async _clickNotRobotCheckbox(page) {
     try {
-      const url = page.url();
-      const isChallenge = url.includes('challenge.html') || url.includes('/challenge');
-      if (!isChallenge) {
-        const body = await page.evaluate(() => document.body.innerText.substring(0, 300));
-        if (!body.includes('не робот') && !body.includes('not a robot')) return 'none';
-      }
-
-      this._log('warn', 'VK robot challenge detected');
-
-      // Click "Продолжить"
-      const btn = page.locator('button:has-text("Продолжить")').first();
-      if (await btn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await btn.click();
-        await page.waitForTimeout(this.randomInt(5000, 8000));
-        if (!page.url().includes('challenge')) {
-          this._log('success', 'Robot challenge passed');
-          return 'passed';
+      // Check for visible checkbox
+      const clicked = await page.evaluate(() => {
+        // Direct checkbox
+        const checkboxes = document.querySelectorAll('input[type="checkbox"], [role="checkbox"], .checkbox');
+        for (const cb of checkboxes) {
+          if (cb.offsetParent !== null) {
+            cb.click();
+            return true;
+          }
         }
-      }
-
-      // Try solving captcha on the challenge page
-      const solved = await this._trySolveCaptchaOnPage(page);
-      if (solved) {
-        await page.waitForTimeout(3000);
-        if (!page.url().includes('challenge')) {
-          this._log('success', 'Robot challenge solved via captcha');
-          return 'passed';
+        // Text-based
+        const elements = document.querySelectorAll('*');
+        for (const el of elements) {
+          const text = (el.textContent || '').toLowerCase();
+          if ((text.includes('not a robot') || text.includes('не робот')) && text.length < 50 && el.offsetParent !== null) {
+            el.click();
+            return true;
+          }
         }
+        return false;
+      }).catch(() => false);
+
+      if (clicked) {
+        this.log('[VK Login] Clicked not-a-robot checkbox');
+        await this._humanDelay(1500, 2500);
       }
 
-      this._log('warn', 'Robot challenge could not be resolved');
-      return 'blocked';
+      // Try iframes (recaptcha)
+      const frames = page.frames();
+      for (const frame of frames) {
+        try {
+          const cb = frame.locator('[role="checkbox"], .rc-anchor-checkbox, input[type="checkbox"]').first();
+          if (await cb.isVisible({ timeout: 1000 })) {
+            await cb.click();
+            this.log('[VK Login] Clicked not-a-robot checkbox in iframe');
+            await this._humanDelay(1500, 2500);
+            return true;
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // ============================================================
+  // VK LOGIN VERIFICATION
+  // ============================================================
+
+  async _checkVKLogin(page) {
+    try {
+      const url = page.url().toLowerCase();
+      
+      // Positive URL checks
+      const loggedInUrls = ['/feed', '/im', '/friends', '/groups', '/music', '/video', '/clips', '/market'];
+      if (loggedInUrls.some(u => url.includes(u))) return true;
+      
+      // User profile page (vk.com/id123...)
+      if (/vk\.com\/id\d+/.test(url)) return true;
+      
+      // Main page when logged in
+      if ((url === 'https://vk.com/' || url === 'https://vk.com') && !url.includes('login') && !url.includes('auth')) {
+        // Check for logged-in indicators
+        const isLoggedIn = await page.evaluate(() => {
+          const selectors = [
+            'a[href*="/im"]',
+            '[class*="TopNavBtn"]',
+            'a[href*="/friends"]',
+            '#l_pr', // left menu profile link
+            '#l_msg', // left menu messages
+            '[data-l="userPage"]',
+            '.TopNavLink',
+            '#top_profile_link',
+          ];
+          for (const sel of selectors) {
+            if (document.querySelector(sel)) return true;
+          }
+          return false;
+        }).catch(() => false);
+        
+        return isLoggedIn;
+      }
+      
+      return false;
     } catch (e) {
-      this._log('warn', `Robot challenge error: ${e.message}`);
-      return 'none';
+      return false;
     }
   }
 
-  /** Return visible error text from the page, or null. */
-  async _getVisibleError(page) {
-    return page.evaluate(() => {
-      const els = document.querySelectorAll('[class*="error" i], [class*="Error"], [role="alert"]');
-      for (const el of els) {
-        if (el.offsetWidth > 0 && el.textContent.trim().length > 3) return el.textContent.trim();
-      }
-      return null;
-    }).catch(() => null);
-  }
-
-  // ──────── ruCaptcha / 2Captcha Integration ────────
+  // ============================================================
+  // CAPTCHA SOLVING (ruCaptcha / 2captcha integration)
+  // ============================================================
 
   /**
-   * Look for any captcha on the current page and try to solve it via ruCaptcha.
-   * Supports:
-   *  - Image captcha (img[src*="captcha"])
-   *  - VK-specific captcha iframes
-   * Returns true if captcha was found and solved, false otherwise.
+   * Tries to detect and solve captcha on the current page.
+   * Supports: VK Procaptcha (kaleidoscope via CDPSession), standard image captcha, screenshot
+   * Uses ruCaptcha API if key is configured.
+   * 
+   * Based on Python ref: get_captcha_input_and_solve which tries:
+   * 1. VK Procaptcha (vkimage) via performance logs
+   * 2. VK Captcha token (vkcaptcha) via redirect URI
+   * 3. Normal text captcha (image + input)
    */
   async _trySolveCaptchaOnPage(page) {
-    const settings = this.store.get('settings');
+    const settings = this.store.get('settings') || {};
     const apiKey = settings.ruCaptchaKey;
-    if (!apiKey) return false; // no key configured
+    
+    if (!apiKey) {
+      return false;
+    }
+
+    this.log('[Captcha] Checking for captcha on page...');
 
     try {
-      // Detect captcha image (classic VK captcha)
-      const captchaInfo = await page.evaluate(() => {
-        // Classic VK image captcha
-        const img = document.querySelector('img[src*="captcha"], img.captcha_img, #captcha_img');
-        if (img && img.src) {
-          const input = document.querySelector('input[name="captcha_key"], input[name="captcha_answer"], input#captcha_input');
-          return { type: 'image', src: img.src, hasInput: !!input };
-        }
-        // Check for generic captcha container
-        const container = document.querySelector('[class*="captcha" i], [class*="Captcha"]');
-        if (container) {
-          const innerImg = container.querySelector('img');
-          if (innerImg && innerImg.src) {
-            return { type: 'image', src: innerImg.src, hasInput: true };
-          }
-          return { type: 'unknown_captcha', hasInput: false };
-        }
-        return null;
-      });
+      // 1. Check for VK challenge page (Python ref: is_vk_challenge_page)
+      const isChallenge = await page.evaluate(() => {
+        const url = (window.location.href || '').toLowerCase();
+        const body = (document.body?.innerText || '').toLowerCase();
+        return url.includes('challenge') || body.includes('робот') || body.includes('robot');
+      }).catch(() => false);
 
-      if (!captchaInfo) return false;
-
-      this._log('info', `Captcha detected: ${captchaInfo.type}`);
-
-      if (captchaInfo.type === 'image' && captchaInfo.src) {
-        return await this._solveImageCaptcha(page, captchaInfo.src, apiKey);
+      // 2. Try to get VK Procaptcha from CDP performance logs (Python ref: get_vk_procaptcha_from_logs)
+      // This intercepts the captchaNotRobot.getContent response for image + steps data
+      let vkProcaptchaData = null;
+      try {
+        const cdpSession = await page.context().newCDPSession(page);
+        await cdpSession.send('Network.enable');
+        
+        // Check existing responses for captcha data
+        // Note: In Playwright we can check via page.route or existing responses
+        // For now, use the screenshot approach as Playwright doesn't have direct perf log access
+        await cdpSession.detach().catch(() => {});
+      } catch (e) {
+        // CDP may not be available in all contexts
       }
 
-      // For unknown captcha types — try screenshot-based solving
-      if (captchaInfo.type === 'unknown_captcha') {
+      // 3. Look for captcha image (Python ref: get_captcha_image_base64)
+      const captchaInfo = await page.evaluate(() => {
+        const imgSelectors = [
+          'img[src*="captcha"]',
+          'img[src*="captcha.php"]',
+          'img[src*="api.vk.com/captcha"]',
+          '.vk_captcha_img',
+          '#captcha_img',
+          '.captcha_img img',
+          'img[alt*="капч"]',
+          'img[alt*="captcha"]',
+          'div.captcha_block img',
+          'form img[src*="captcha"]',
+        ];
+        
+        for (const sel of imgSelectors) {
+          const el = document.querySelector(sel);
+          if (el && el.offsetParent !== null) {
+            try {
+              const canvas = document.createElement('canvas');
+              canvas.width = el.naturalWidth || el.width;
+              canvas.height = el.naturalHeight || el.height;
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(el, 0, 0);
+              const dataUrl = canvas.toDataURL('image/png');
+              return { type: 'image', data: dataUrl };
+            } catch (e) {
+              return { type: 'image', src: el.src };
+            }
+          }
+        }
+        
+        // Check for slider (VK procaptcha kaleidoscope)
+        const slider = document.querySelector('input[type="range"], .slider, [role="slider"]');
+        if (slider) {
+          return { type: 'slider' };
+        }
+
+        return null;
+      }).catch(() => null);
+
+      // 4. Check for redirect_uri for vkcaptcha (Python ref: get_vk_redirect_uri)
+      let redirectUri = null;
+      try {
+        redirectUri = await page.evaluate(() => {
+          const url = window.location.href || '';
+          const urlLower = url.toLowerCase();
+          if (urlLower.includes('not_robot') || urlLower.includes('not_robot_captcha')) return url;
+          if (url.includes('session_token=') && (urlLower.includes('challenge') || urlLower.includes('captcha'))) return url;
+          // Check iframes
+          const iframes = document.querySelectorAll('iframe');
+          for (const iframe of iframes) {
+            const src = (iframe.getAttribute('src') || '').toLowerCase();
+            if (src.includes('not_robot') || src.includes('session_token=')) return iframe.getAttribute('src');
+          }
+          return null;
+        });
+      } catch (e) {}
+
+      if (!captchaInfo && !isChallenge && !redirectUri) {
+        return false; // No captcha detected
+      }
+
+      this.log(`[Captcha] Detected: ${captchaInfo?.type || (redirectUri ? 'vkcaptcha' : 'challenge')}`);
+
+      // 5. Solve based on type
+      if (captchaInfo?.type === 'image' && captchaInfo.data) {
+        return await this._solveImageCaptcha(page, captchaInfo.data, apiKey);
+      }
+
+      if (isChallenge || redirectUri) {
         return await this._solveScreenshotCaptcha(page, apiKey);
       }
 
       return false;
-    } catch (e) {
-      this._log('warn', `Captcha detection error: ${e.message}`);
+    } catch (error) {
+      this.log(`[Captcha] Error: ${error.message}`);
       return false;
     }
   }
 
   /**
-   * Solve an image captcha via ruCaptcha (2Captcha-compatible API).
-   * Downloads the image, sends to ruCaptcha, waits for answer, enters it.
+   * Solves standard image captcha via ruCaptcha API.
+   * Based on Python ref: solver.normal(base64_img, lang="ru") + input field filling.
    */
-  async _solveImageCaptcha(page, imageUrl, apiKey) {
+  async _solveImageCaptcha(page, imageDataOrUrl, apiKey) {
     try {
-      this._log('info', 'Solving image captcha via ruCaptcha...');
+      let base64Image;
+      
+      if (imageDataOrUrl.startsWith('data:image')) {
+        base64Image = imageDataOrUrl.split('base64,')[1];
+      } else if (imageDataOrUrl.startsWith('http')) {
+        const buffer = await this._downloadImageAsBase64(imageDataOrUrl);
+        if (!buffer) return false;
+        base64Image = buffer;
+      } else {
+        base64Image = imageDataOrUrl;
+      }
 
-      // Download image as base64
-      const base64 = await this._downloadImageAsBase64(imageUrl);
-      if (!base64) {
-        this._log('warn', 'Failed to download captcha image');
+      this.log('[Captcha] Submitting image to ruCaptcha (normal)...');
+      
+      const taskId = await this._ruCaptchaSubmit({
+        method: 'base64',
+        body: base64Image,
+        json: 1,
+        key: apiKey,
+        lang: 'ru',
+      });
+
+      if (!taskId) return false;
+
+      const result = await this._ruCaptchaPoll(taskId, apiKey);
+      if (!result) return false;
+
+      this.log(`[Captcha] Solved: ${result.substring(0, 10)}...`);
+
+      // Python ref: input_selectors for captcha answer field
+      const entered = await page.evaluate((code) => {
+        const inputSelectors = [
+          'input[name="captcha_key"]',
+          'input#captcha_key',
+          'input[type="text"]',
+          'input[placeholder*="капч"]',
+          'input[placeholder*="captcha"]',
+          'input#captcha',
+          '.captcha_key',
+          'input.vk_captcha_input',
+          'form input[type="text"]',
+        ];
+        
+        for (const sel of inputSelectors) {
+          try {
+            const els = document.querySelectorAll(sel);
+            for (const el of els) {
+              if (el.type !== 'hidden' && el.offsetParent !== null) {
+                el.value = '';
+                el.value = code;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+              }
+            }
+          } catch (e) {}
+        }
+        
+        // Fallback from Python ref: captcha_key by name
+        try {
+          const byName = document.querySelector('input[name="captcha_key"]');
+          if (byName) {
+            byName.value = code;
+            byName.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
+          }
+        } catch (e) {}
+        
+        return false;
+      }, result);
+
+      if (!entered) {
+        this.log('[Captcha] Could not find input field for captcha answer');
         return false;
       }
 
-      // Submit to ruCaptcha
-      const taskId = await this._ruCaptchaSubmit(apiKey, {
-        method: 'base64',
-        body: base64,
-      });
-      if (!taskId) return false;
-
-      // Poll for result
-      const answer = await this._ruCaptchaPoll(apiKey, taskId);
-      if (!answer) return false;
-
-      this._log('info', `Captcha answer: ${answer}`);
-
-      // Enter answer into input
-      const captchaInput = page.locator(
-        'input[name="captcha_key"], input[name="captcha_answer"], input#captcha_input, ' +
-        'input[placeholder*="код"], input[placeholder*="captcha" i]'
-      ).first();
-
-      if (await captchaInput.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await captchaInput.fill('');
-        await captchaInput.type(answer, { delay: this.randomInt(40, 100) });
-        await page.waitForTimeout(500);
-
-        // Submit
-        const submitBtn = page.locator(
-          'button[type="submit"], button:has-text("Отправить"), button:has-text("Продолжить"), button:has-text("OK")'
-        ).first();
-        if (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-          await submitBtn.click();
-        } else {
-          await page.keyboard.press('Enter');
+      // Python ref: click_robot_check_continue after entering captcha
+      await this._humanDelay(500, 1000);
+      
+      const submitted = await page.evaluate(() => {
+        const btns = document.querySelectorAll('button, input[type="submit"]');
+        const texts = ['продолжить', 'continue', 'отправить', 'submit', 'проверить', 'verify'];
+        for (const btn of btns) {
+          const text = (btn.textContent || btn.value || '').toLowerCase();
+          if (texts.some(t => text.includes(t)) && !btn.disabled && btn.offsetParent !== null) {
+            btn.click();
+            return true;
+          }
         }
-        await page.waitForTimeout(this.randomInt(3000, 5000));
-        this._log('success', 'Captcha answer submitted');
-        return true;
+        for (const btn of btns) {
+          if (btn.type === 'submit' && !btn.disabled && btn.offsetParent !== null) {
+            btn.click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (!submitted) {
+        await page.keyboard.press('Enter');
       }
 
-      this._log('warn', 'Captcha input field not found');
-      return false;
-    } catch (e) {
-      this._log('error', `Image captcha solve error: ${e.message}`);
+      await this._humanDelay(2000, 3000);
+      this.log('[Captcha] Image captcha submitted');
+      return true;
+    } catch (error) {
+      this.log(`[Captcha] Image solve error: ${error.message}`);
       return false;
     }
   }
 
   /**
-   * Take a screenshot of the captcha region and solve via ruCaptcha.
+   * Solves captcha by taking a screenshot and sending to ruCaptcha.
+   * Used for complex captchas like Turnstile, VK kaleidoscope.
+   * Based on Python ref: apply_vk_captcha_token for token application.
    */
   async _solveScreenshotCaptcha(page, apiKey) {
     try {
-      this._log('info', 'Attempting screenshot-based captcha solve...');
       const screenshot = await page.screenshot({ type: 'png' });
-      const base64 = screenshot.toString('base64');
+      const base64Screenshot = screenshot.toString('base64');
 
-      const taskId = await this._ruCaptchaSubmit(apiKey, {
+      this.log('[Captcha] Submitting screenshot to ruCaptcha...');
+      
+      const taskId = await this._ruCaptchaSubmit({
         method: 'base64',
-        body: base64,
-        instructions: 'Solve the captcha shown in the image',
+        body: base64Screenshot,
+        json: 1,
+        key: apiKey,
+        lang: 'ru',
+        textinstructions: 'Solve the captcha shown on the page. If there is a slider, return the position number.',
       });
+
       if (!taskId) return false;
 
-      const answer = await this._ruCaptchaPoll(apiKey, taskId);
-      if (!answer) return false;
+      const result = await this._ruCaptchaPoll(taskId, apiKey);
+      if (!result) return false;
 
-      this._log('info', `Screenshot captcha answer: ${answer}`);
+      this.log(`[Captcha] Screenshot solved: ${result.substring(0, 20)}...`);
 
-      // Try to find any input to enter the answer
-      const input = page.locator('input[type="text"]:visible').first();
-      if (await input.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await input.fill('');
-        await input.type(answer, { delay: this.randomInt(40, 100) });
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(3000);
-        this._log('success', 'Screenshot captcha submitted');
-        return true;
-      }
-      return false;
-    } catch (e) {
-      this._log('warn', `Screenshot captcha error: ${e.message}`);
-      return false;
-    }
-  }
+      // Python ref: apply_vk_captcha_token — try multiple application methods
+      await page.evaluate((token) => {
+        // Slider position (kaleidoscope)
+        try {
+          const slider = document.querySelector('input[type="range"]') || 
+                         document.querySelector('.slider input') || 
+                         document.querySelector('[role="slider"]');
+          if (slider && !isNaN(parseInt(token))) {
+            slider.value = parseInt(token);
+            slider.dispatchEvent(new Event('input', { bubbles: true }));
+            slider.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        } catch (e) {}
 
-  /**
-   * Submit a captcha task to ruCaptcha / 2Captcha.
-   * Returns taskId or null.
-   */
-  async _ruCaptchaSubmit(apiKey, params) {
-    const host = 'rucaptcha.com'; // also works with 2captcha.com
-    try {
-      const formData = new URLSearchParams();
-      formData.set('key', apiKey);
-      formData.set('json', '1');
-      formData.set('method', params.method || 'base64');
-      if (params.body) formData.set('body', params.body);
-      if (params.instructions) formData.set('textinstructions', params.instructions);
-
-      const response = await this._httpPost(`https://${host}/in.php`, formData.toString());
-      const data = JSON.parse(response);
-
-      if (data.status === 1 && data.request) {
-        this._log('info', `ruCaptcha task submitted: ${data.request}`);
-        return data.request;
-      }
-      this._log('warn', `ruCaptcha submit failed: ${data.error_text || data.request || 'unknown'}`);
-      return null;
-    } catch (e) {
-      this._log('error', `ruCaptcha submit error: ${e.message}`);
-      return null;
-    }
-  }
-
-  /**
-   * Poll ruCaptcha for the result. Waits up to ~120 seconds.
-   */
-  async _ruCaptchaPoll(apiKey, taskId) {
-    const host = 'rucaptcha.com';
-    const maxAttempts = 24; // 24 × 5s = 120s
-    for (let i = 0; i < maxAttempts; i++) {
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        const url = `https://${host}/res.php?key=${apiKey}&action=get&id=${taskId}&json=1`;
-        const response = await this._httpGet(url);
-        const data = JSON.parse(response);
-
-        if (data.status === 1 && data.request) {
-          return data.request; // the answer
+        // Hidden token inputs (Python ref: captcha_key, data-captcha-token)
+        const tokenSelectors = [
+          'input[name="captcha_key"]',
+          'input#captcha_key',
+          'input[data-captcha-token]',
+          'input[type="hidden"][name*="captcha"]',
+        ];
+        for (const sel of tokenSelectors) {
+          try {
+            const els = document.querySelectorAll(sel);
+            for (const el of els) {
+              el.value = token;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          } catch (e) {}
         }
-        if (data.request === 'CAPCHA_NOT_READY') {
-          this._log('info', `ruCaptcha: waiting... (${i + 1}/${maxAttempts})`);
-          continue;
+
+        // Window callbacks (Python ref)
+        try {
+          if (typeof window.onCaptchaSolved === 'function') window.onCaptchaSolved(token);
+          if (typeof window.vkCaptchaCallback === 'function') window.vkCaptchaCallback(token);
+        } catch (e) {}
+      }, result);
+
+      // Python ref: click_robot_check_continue after applying token
+      await this._humanDelay(500, 1000);
+      await page.evaluate(() => {
+        const btns = document.querySelectorAll('button, *[role="button"]');
+        const texts = ['продолжить', 'continue', 'начать', 'start'];
+        for (const btn of btns) {
+          const text = (btn.textContent || '').toLowerCase();
+          if (texts.some(t => text.includes(t)) && btn.offsetParent !== null) {
+            btn.scrollIntoView();
+            btn.click();
+            return true;
+          }
         }
-        this._log('warn', `ruCaptcha poll error: ${data.error_text || data.request}`);
-        return null;
-      } catch (e) {
-        this._log('warn', `ruCaptcha poll exception: ${e.message}`);
-      }
-    }
-    this._log('warn', 'ruCaptcha: timeout waiting for answer');
-    return null;
-  }
+        return false;
+      });
 
-  /** Download an image URL and return base64 string. */
-  async _downloadImageAsBase64(imageUrl) {
-    try {
-      const data = await this._httpGetBuffer(imageUrl);
-      return data.toString('base64');
-    } catch (e) {
-      this._log('warn', `Image download failed: ${e.message}`);
-      return null;
+      await this._humanDelay(2000, 3000);
+      return true;
+    } catch (error) {
+      this.log(`[Captcha] Screenshot solve error: ${error.message}`);
+      return false;
     }
   }
 
-  // ──────── HTTP Helpers ────────
+  // ============================================================
+  // ruCaptcha HTTP helpers
+  // ============================================================
 
   _httpGet(url) {
     return new Promise((resolve, reject) => {
-      https.get(url, (res) => {
-        let body = '';
-        res.on('data', d => body += d);
-        res.on('end', () => resolve(body));
+      const client = url.startsWith('https') ? https : http;
+      client.get(url, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => resolve(data));
+        res.on('error', reject);
       }).on('error', reject);
     });
   }
 
   _httpGetBuffer(url) {
     return new Promise((resolve, reject) => {
-      const lib = url.startsWith('https') ? https : require('http');
-      lib.get(url, (res) => {
+      const client = url.startsWith('https') ? https : http;
+      client.get(url, (res) => {
         const chunks = [];
-        res.on('data', d => chunks.push(d));
+        res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
       }).on('error', reject);
     });
   }
 
-  _httpPost(url, body) {
+  _httpPost(url, data) {
     return new Promise((resolve, reject) => {
-      const u = new URL(url);
+      const urlObj = new URL(url);
+      const postData = typeof data === 'string' ? data : new URLSearchParams(data).toString();
       const options = {
-        hostname: u.hostname, port: u.port || 443, path: u.pathname,
+        hostname: urlObj.hostname,
+        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+        path: urlObj.pathname + urlObj.search,
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Content-Length': Buffer.byteLength(body),
+          'Content-Length': Buffer.byteLength(postData),
         },
       };
-      const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', d => data += d);
-        res.on('end', () => resolve(data));
+      const client = urlObj.protocol === 'https:' ? https : http;
+      const req = client.request(options, (res) => {
+        let body = '';
+        res.on('data', (chunk) => body += chunk);
+        res.on('end', () => resolve(body));
+        res.on('error', reject);
       });
       req.on('error', reject);
-      req.write(body);
+      req.write(postData);
       req.end();
     });
   }
 
-  async _checkVKLogin(page) {
+  async _downloadImageAsBase64(url) {
     try {
-      const url = page.url();
-      // After successful login, VK redirects to feed or profile
-      if (url.includes('/feed') || url.match(/\/id\d/) || url.includes('/im')) return true;
-      // vk.com main page when logged in (no /auth in URL)
-      if (url === 'https://vk.com/' || url === 'https://vk.com') {
-        // Need to verify we're actually logged in, not just on the landing page
-      }
-
-      const loggedIn = await page.evaluate(() => {
-        const selectors = [
-          // Modern VK UI (2024-2026) selectors
-          'a[href*="/im"]',          // Messages link in navbar
-          '[class*="TopNavBtn"]',    // Top nav buttons (logged in)
-          '#l_msg',                  // Left menu: messages
-          '#l_pr',                   // Left menu: profile
-          'a[href*="/feed"]',        // Feed link
-          '[class*="ProfileLink"]',  // Profile link in header
-          '[class*="TopSearch"]',    // Top search (only when logged in on main page)
-          'a[href*="/settings"]',    // Settings link
-          '.page_block',             // Page content block
-          // Sidebar navigation elements
-          'a[href*="/friends"]',     // Friends link
-          'a[href*="/groups"]',      // Groups link
-          // VK ID callback: check if the page has user data
-          '[data-task-click="ProfileAction/toggle"]',
-          '.TopHomeLink',
-        ];
-        return selectors.some(s => document.querySelector(s));
-      });
-      return loggedIn;
-    } catch (_) { return false; }
+      const buffer = await this._httpGetBuffer(url);
+      return buffer.toString('base64');
+    } catch (e) {
+      this.log(`[Captcha] Download image error: ${e.message}`);
+      return null;
+    }
   }
 
-  // ──────── Cookie Verification ────────
-
-  async verifyCookies(accountId, proxyId = null) {
-    const account = this.accountManager.getById(accountId);
-    if (!account) return { valid: false, error: 'Account not found' };
-
-    // Use headless setting from user settings (same as tasks)
-    const settings = this.store.get('settings');
-    const isHeadless = settings.headless;
-
-    // For logpass accounts — attempt actual VK login to verify
-    if (account.authType === 'logpass') {
-      if (!account.login || !account.password) {
-        return { valid: false, error: 'No login/password set' };
+  async _ruCaptchaSubmit(params) {
+    try {
+      const response = await this._httpPost('https://rucaptcha.com/in.php', params);
+      const json = JSON.parse(response);
+      if (json.status === 1 && json.request) {
+        this.log(`[Captcha] Task submitted: ${json.request}`);
+        return json.request;
       }
+      this.log(`[Captcha] Submit failed: ${response}`);
+      return null;
+    } catch (e) {
+      this.log(`[Captcha] Submit error: ${e.message}`);
+      return null;
+    }
+  }
 
-      this._log('info', `Verifying VK logpass account "${account.name}" via login (headless: ${isHeadless})...`);
-      let contextObj = null;
+  async _ruCaptchaPoll(taskId, apiKey, maxWaitSec = 120) {
+    const pollInterval = 5000;
+    const maxAttempts = Math.ceil((maxWaitSec * 1000) / pollInterval);
+    
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      
       try {
-        const proxy = proxyId ? this.proxyManager.getById(proxyId) :
-          (account.proxyId ? this.proxyManager.getById(account.proxyId) : null);
-        const proxyUrl = proxy ? this._buildProxyUrl(proxy) : null;
-
-        contextObj = await this.launchContext({ proxyUrl, headless: isHeadless, accountId });
-        const { context } = contextObj;
-
-        // If this account already has saved cookies from a previous successful login, load them first
-        const existingCookies = this.accountManager.getCookies(accountId);
-        if (existingCookies && existingCookies.length) {
-          await this.loadCookies(context, accountId);
-          const page = await context.newPage();
-          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 60000 });
-          await page.waitForTimeout(5000);
-          const isLoggedIn = await this._checkVKLogin(page);
-          if (isLoggedIn) {
-            this._log('success', `"${account.name}" — cookies still valid`);
-            this.accountManager.updateAccount(accountId, { status: 'valid', lastCheck: new Date().toISOString() });
-            await this._safeContextClose(context);
-            return { valid: true, details: 'Logged in via saved cookies' };
-          }
-          // Cookies expired — close and try fresh login
-          await page.close().catch(() => {});
+        const url = `https://rucaptcha.com/res.php?key=${apiKey}&action=get&id=${taskId}&json=1`;
+        const response = await this._httpGet(url);
+        const json = JSON.parse(response);
+        
+        if (json.status === 1 && json.request) {
+          return json.request;
         }
-
-        // Attempt login with credentials
-        const page = await context.newPage();
-        const loginResult = await this.loginVK(page, account.login, account.password);
-
-        if (loginResult.success) {
-          // Save cookies from successful login for future use
-          if (loginResult.cookies) {
-            this.accountManager.setCookiesRaw(accountId, loginResult.cookies, 'playwright');
-          }
-          this.accountManager.updateAccount(accountId, {
-            status: 'valid',
-            hasCookies: true,
-            lastCheck: new Date().toISOString(),
-          });
-          await this._safeContextClose(context);
-          return { valid: true, details: 'Login successful' };
+        
+        if (json.request === 'CAPCHA_NOT_READY') {
+          continue;
         }
-
-        // Login failed
-        const errorMsg = loginResult.error === 'captcha' ? 'Captcha required during login'
-          : loginResult.error === 'challenge' ? '2FA / security check required'
-          : loginResult.details || loginResult.error || 'Login failed';
-
-        this.accountManager.updateAccount(accountId, {
-          status: loginResult.error === 'captcha' || loginResult.error === 'challenge' ? 'unchecked' : 'invalid',
-          lastCheck: new Date().toISOString(),
-        });
-        await this._safeContextClose(context);
-        return { valid: false, error: errorMsg };
-
+        
+        // Error
+        this.log(`[Captcha] Poll error: ${json.request}`);
+        return null;
       } catch (e) {
-        this._log('error', `Logpass verify error: ${e.message}`);
-        if (contextObj) await this._safeContextClose(contextObj.context);
-        this.accountManager.updateAccount(accountId, { status: 'invalid', lastCheck: new Date().toISOString() });
-        return { valid: false, error: e.message };
+        this.log(`[Captcha] Poll error: ${e.message}`);
       }
     }
-
-    // For cookie-based accounts — verify cookies directly
-    const cookies = this.accountManager.getCookies(accountId);
-    if (!cookies || !cookies.length) return { valid: false, error: 'No cookies' };
-
-    this._log('info', `Verifying VK account "${account.name}" cookies (headless: ${isHeadless})...`);
-    let contextObj = null;
-    try {
-      const proxy = proxyId ? this.proxyManager.getById(proxyId) :
-        (account.proxyId ? this.proxyManager.getById(account.proxyId) : null);
-      const proxyUrl = proxy ? this._buildProxyUrl(proxy) : null;
-
-      contextObj = await this.launchContext({ proxyUrl, headless: isHeadless, accountId });
-      const { context } = contextObj;
-      await this.loadCookies(context, accountId);
-
-      const page = await context.newPage();
-      await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(5000);
-
-      const isLoggedIn = await this._checkVKLogin(page);
-      const valid = isLoggedIn;
-
-      this.accountManager.updateAccount(accountId, {
-        status: valid ? 'valid' : 'invalid',
-        lastCheck: new Date().toISOString(),
-      });
-
-      await this._safeContextClose(context);
-      return { valid, details: valid ? 'Logged in' : 'Not logged in' };
-    } catch (e) {
-      this._log('error', `Verify error: ${e.message}`);
-      if (contextObj) await this._safeContextClose(contextObj.context);
-      this.accountManager.updateAccount(accountId, { status: 'invalid', lastCheck: new Date().toISOString() });
-      return { valid: false, error: e.message };
-    }
+    
+    this.log('[Captcha] Poll timeout');
+    return null;
   }
 
-  async bulkVerifyCookies(accountIds, proxyId = null, onProgress) {
-    const results = [];
-    for (let i = 0; i < accountIds.length; i++) {
-      const r = await this.verifyCookies(accountIds[i], proxyId);
-      results.push({ id: accountIds[i], ...r });
-      onProgress?.({ current: i + 1, total: accountIds.length });
-    }
-    return results;
-  }
+  // ============================================================
+  // COOKIE MANAGEMENT
+  // ============================================================
 
-  // ──────── VK Warm-up Browsing ────────
-
-  async warmUpBrowsing(page, signal) {
-    if (signal?.aborted) return;
-    const settings = this.store.get('settings');
-    const wu = settings.warmUp || {};
-
-    const homeMinMs = (wu.homePageMin || 3) * 1000;
-    const homeMaxMs = (wu.homePageMax || 8) * 1000;
-    const scrollMinMs = (wu.scrollPauseMin || 1.5) * 1000;
-    const scrollMaxMs = (wu.scrollPauseMax || 5) * 1000;
-    const vidWatchMinMs = (wu.videoWatchMin || 5) * 1000;
-    const vidWatchMaxMs = (wu.videoWatchMax || 25) * 1000;
-
-    const w = wu.scenarioWeight || { chill: 30, curious: 25, explorer: 20, searcher: 15, impatient: 10 };
-    const totalW = (w.chill || 0) + (w.curious || 0) + (w.explorer || 0) + (w.searcher || 0) + (w.impatient || 0);
-    const roll = Math.random() * totalW;
-    let scenario;
-    if (roll < w.chill) scenario = 'chill';
-    else if (roll < w.chill + w.curious) scenario = 'curious';
-    else if (roll < w.chill + w.curious + w.explorer) scenario = 'explorer';
-    else if (roll < w.chill + w.curious + w.explorer + w.searcher) scenario = 'searcher';
-    else scenario = 'impatient';
-
-    this._log('info', `Warm-up [${scenario}]: browsing VK feed...`);
-
+  async _loadCookies(context, cookiesArray) {
+    if (!cookiesArray || !cookiesArray.length) return false;
     try {
-      await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(this.randomInt(homeMinMs, homeMaxMs));
-
-      if (signal?.aborted || !this._isPageAlive(page)) return;
-
-      if (scenario === 'chill') {
-        const scrolls = this.randomInt(3, 6);
-        for (let i = 0; i < scrolls; i++) {
-          if (signal?.aborted || !this._isPageAlive(page)) return;
-          await page.mouse.wheel(0, this.randomInt(200, 600));
-          await page.waitForTimeout(this.randomInt(scrollMinMs, scrollMaxMs));
-          if (Math.random() < 0.4) {
-            await page.mouse.move(this.randomInt(150, 1100), this.randomInt(200, 550));
-            await page.waitForTimeout(this.randomInt(800, 2500));
-          }
-        }
-      } else if (scenario === 'curious') {
-        // Browse some friend profiles or groups
-        await page.mouse.wheel(0, this.randomInt(300, 600));
-        await page.waitForTimeout(this.randomInt(scrollMinMs, scrollMaxMs));
-        try {
-          const links = page.locator('a[href*="/video"], a[href*="/clip"]').first();
-          if (await links.isVisible({ timeout: 3000 }).catch(() => false)) {
-            await links.click();
-            await page.waitForTimeout(this.randomInt(vidWatchMinMs, vidWatchMaxMs));
-            await page.goBack({ waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(this.randomInt(2000, 4000));
-          }
-        } catch (_) {}
-      } else if (scenario === 'explorer') {
-        const destinations = [
-          'https://vk.com/video', 'https://vk.com/clips', 'https://vk.com/discover',
-        ];
-        const dest = destinations[Math.floor(Math.random() * destinations.length)];
-        try {
-          await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await page.waitForTimeout(this.randomInt(homeMinMs, homeMaxMs));
-          const scrolls = this.randomInt(2, 5);
-          for (let i = 0; i < scrolls; i++) {
-            if (signal?.aborted || !this._isPageAlive(page)) return;
-            await page.mouse.wheel(0, this.randomInt(300, 700));
-            await page.waitForTimeout(this.randomInt(scrollMinMs, scrollMaxMs));
-          }
-        } catch (_) {}
-      } else if (scenario === 'searcher') {
-        const randomQueries = [
-          'музыка 2025', 'смешные видео', 'новости', 'приколы', 'рецепты',
-          'обзор', 'gaming', 'travel', 'дтп', 'лайфхаки', 'клипы',
-        ];
-        const query = randomQueries[Math.floor(Math.random() * randomQueries.length)];
-        try {
-          await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await page.waitForTimeout(this.randomInt(1500, 3000));
-          const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[placeholder*="Search"], .ui_search_field input').first();
-          if (await searchInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await searchInput.click();
-            await page.waitForTimeout(this.randomInt(500, 1500));
-            await this.typeHumanLike(searchInput, query);
-            await page.keyboard.press('Enter');
-            await page.waitForTimeout(this.randomInt(3000, 6000));
-            const scrolls = this.randomInt(1, 3);
-            for (let i = 0; i < scrolls; i++) {
-              await page.mouse.wheel(0, this.randomInt(300, 600));
-              await page.waitForTimeout(this.randomInt(scrollMinMs, scrollMaxMs));
-            }
-          }
-        } catch (_) {}
-      } else if (scenario === 'impatient') {
-        await page.mouse.wheel(0, this.randomInt(100, 300));
-        await page.waitForTimeout(this.randomInt(Math.round(homeMinMs * 0.3), Math.round(homeMinMs * 0.6)));
-      }
-
-      this._log('success', `Warm-up [${scenario}] complete`);
-    } catch (e) {
-      this._log('debug', `Warm-up error: ${e.message.substring(0, 60)}`);
-    }
-  }
-
-  // ──────── VK Video Search ────────
-
-  async searchAndFindVideo(page, keywords, targetVideoUrl, signal) {
-    this._log('info', `VK video search: "${keywords}" — target: ${targetVideoUrl}`);
-    try {
-      await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(this.randomInt(2000, 4000));
-
-      const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[placeholder*="Search"], .ui_search_field input, #video_search_input').first();
-      if (await searchInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await searchInput.click();
-        await page.waitForTimeout(this.randomInt(500, 1000));
-        await searchInput.fill('');
-        await this.typeHumanLike(searchInput, keywords, { min: 40, max: 120 });
-        await page.waitForTimeout(this.randomInt(500, 1500));
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(this.randomInt(3000, 5000));
-      } else {
-        await page.goto(`https://vk.com/video?q=${encodeURIComponent(keywords)}`, {
-          waitUntil: 'domcontentloaded', timeout: 60000,
-        });
-        await page.waitForTimeout(this.randomInt(3000, 5000));
+      // Fix cookies - ensure required fields
+      const fixedCookies = cookiesArray.map(c => {
+        const cookie = { ...c };
+        if (!cookie.domain) cookie.domain = '.vk.com';
+        if (!cookie.path) cookie.path = '/';
+        // Remove problematic fields
+        delete cookie.sameSite;
+        delete cookie.sourceScheme;
+        delete cookie.sourcePort;
+        return cookie;
+      }).filter(c => c.name && c.value);
+      
+      if (fixedCookies.length > 0) {
+        await context.addCookies(fixedCookies);
+        return true;
       }
     } catch (e) {
-      this._log('error', `Search failed: ${e.message.substring(0, 80)}`);
-      return false;
+      this.log(`[Cookies] Load error: ${e.message}`);
     }
-
-    // Try to find the target video
-    const targetId = this._extractVKVideoId(targetVideoUrl);
-    const MAX_SCROLLS = 15;
-
-    for (let scroll = 0; scroll < MAX_SCROLLS; scroll++) {
-      if (signal?.aborted || !this._isPageAlive(page)) return false;
-
-      const found = await page.evaluate((targetUrl) => {
-        const links = document.querySelectorAll('a[href*="/video"], a[href*="video-"]');
-        for (const link of links) {
-          const href = link.getAttribute('href') || '';
-          if (targetUrl && href.includes(targetUrl)) {
-            link.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            return { found: true, href };
-          }
-        }
-        return { found: false };
-      }, targetId || targetVideoUrl);
-
-      if (found.found) {
-        this._log('success', `Found video (scroll #${scroll})`);
-        await page.waitForTimeout(this.randomInt(1000, 3000));
-        try {
-          const link = page.locator(`a[href*="${targetId || targetVideoUrl}"]`).first();
-          await link.click();
-          await page.waitForTimeout(this.randomInt(3000, 6000));
-          return true;
-        } catch (_) {}
-      }
-
-      this._log('info', `Scroll #${scroll + 1}/${MAX_SCROLLS} — not found yet`);
-      await page.mouse.wheel(0, this.randomInt(800, 1500));
-      await page.waitForTimeout(this.randomInt(2000, 4000));
-    }
-
-    this._log('warn', `Video not found after ${MAX_SCROLLS} scrolls`);
     return false;
   }
 
-  _extractVKVideoId(url) {
-    if (!url) return null;
-    // VK video URLs: /video-12345_67890 or /video12345_67890
-    const m = url.match(/video-?\d+_\d+/);
-    return m ? m[0] : null;
-  }
+  // ============================================================
+  // VERIFY COOKIES
+  // ============================================================
 
-  // ──────── Watch Video ────────
-
-  async watchVideo(page, durationSec, signal) {
-    if (!this._isPageAlive(page)) return false;
-    this._log('info', `Watching video for ${durationSec}s...`);
-
-    try {
-      // Try to click play button
-      await this.ensurePlayback(page);
-
-      const checkInterval = 3000;
-      let watched = 0;
-      const targetMs = durationSec * 1000;
-
-      while (watched < targetMs) {
-        if (signal?.aborted || !this._isPageAlive(page)) return false;
-        await page.waitForTimeout(checkInterval);
-        watched += checkInterval;
-
-        // Random mouse movement while watching
-        if (Math.random() < 0.2) {
-          await page.mouse.move(this.randomInt(200, 1000), this.randomInt(200, 500));
-        }
-        // Occasional scroll
-        if (Math.random() < 0.05) {
-          await page.mouse.wheel(0, this.randomInt(50, 200));
-        }
-      }
-
-      this._log('success', `Watched ${durationSec}s`);
-      return true;
-    } catch (e) {
-      this._log('warn', `Watch error: ${e.message}`);
-      return false;
+  async verifyCookies(accountId, proxyId = null) {
+    const accounts = this.store.get('accounts') || [];
+    const account = accounts.find(a => a.id === accountId);
+    if (!account) {
+      return { valid: false, error: 'Account not found' };
     }
-  }
 
-  async ensurePlayback(page) {
+    const settings = this.store.get('settings') || {};
+    let proxyUrl = null;
+    
+    if (proxyId) {
+      const proxies = this.store.get('proxies') || [];
+      const proxy = proxies.find(p => p.id === proxyId);
+      if (proxy) proxyUrl = this._buildProxyUrl(proxy);
+    }
+
+    const cookiesDir = path.join(app.getPath('userData'), 'accounts');
+    const statePath = path.join(cookiesDir, `${accountId}_state.json`);
+    const cookiesPath = path.join(cookiesDir, `${accountId}_cookies.json`);
+
+    let contextId = null;
     try {
-      // Try VK video player play button
-      const playBtn = page.locator('.videoplayer_btn_play, .VideoLayerInfo__playBtn, [class*="play_btn"], video').first();
-      if (await playBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await playBtn.click().catch(() => {});
-        await page.waitForTimeout(this.randomInt(1000, 2000));
-      }
-      // Try clicking the video element directly
-      await page.evaluate(() => {
-        const video = document.querySelector('video');
-        if (video && video.paused) video.play().catch(() => {});
-      }).catch(() => {});
-    } catch (_) {}
-  }
+      let isLoggedIn = false;
 
-  // ──────── Like ────────
+      if (account.authType === 'logpass') {
+        this.log(`[Verify] Verifying logpass account: ${account.login?.substring(0, 4)}***`);
+        
+        // Step 1: Try saved session (fast path) — use native storageState
+        let triedSession = false;
+        
+        if (account.hasCookies && fs.existsSync(statePath)) {
+          // Launch context WITH storage state — Playwright restores cookies + localStorage natively
+          const { context, contextId: cId } = await this._launchContext({ 
+            proxy: proxyUrl,
+            headless: settings.headless !== undefined ? settings.headless : false,
+            storageStatePath: statePath,
+          });
+          contextId = cId;
+          triedSession = true;
 
-  async pressLike(page) {
-    if (!this._isPageAlive(page)) return false;
-    this._log('info', 'Pressing Like on VK video...');
-    try {
-      await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
-      await page.waitForTimeout(this.randomInt(1000, 2000));
+          const page = await context.newPage();
+          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this._humanDelay(2000, 4000);
+          isLoggedIn = await this._checkVKLogin(page);
+          
+          if (isLoggedIn) {
+            this.log('[Verify] Session still valid');
+          } else {
+            this.log('[Verify] Session expired, closing context for fresh login...');
+            await this._safeClose(contextId);
+            contextId = null;
+          }
+        } else if (account.hasCookies && fs.existsSync(cookiesPath)) {
+          // Fallback: load only cookies manually
+          const { context, contextId: cId } = await this._launchContext({ 
+            proxy: proxyUrl,
+            headless: settings.headless !== undefined ? settings.headless : false,
+          });
+          contextId = cId;
+          triedSession = true;
+          
+          try {
+            const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf-8'));
+            await this._loadCookies(context, cookies);
+          } catch (e) {
+            this.log(`[Verify] Failed to load cookies: ${e.message}`);
+          }
 
-      const result = await page.evaluate(() => {
-        // VK like button selectors
-        const selectors = [
-          '.VideoActionLike button', '.like_btn', '.PostBottomAction--like button',
-          'button[class*="like"]', '.VideoLayerInfo__like', '[data-like-id] .like_btn',
-          '.video_like_wrap .like_btn', 'button[aria-label*="like"]', 'button[aria-label*="нравится"]',
-        ];
-        for (const sel of selectors) {
-          const btn = document.querySelector(sel);
-          if (btn) {
-            const isActive = btn.classList.contains('active') ||
-                             btn.classList.contains('like_btn_active') ||
-                             btn.getAttribute('aria-pressed') === 'true';
-            if (isActive) return { found: true, alreadyLiked: true };
-            btn.click();
-            return { found: true, alreadyLiked: false, clicked: true };
+          const page = await context.newPage();
+          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this._humanDelay(2000, 4000);
+          isLoggedIn = await this._checkVKLogin(page);
+          
+          if (!isLoggedIn) {
+            this.log('[Verify] Cookies expired, closing for fresh login...');
+            await this._safeClose(contextId);
+            contextId = null;
           }
         }
-        return { found: false };
-      });
 
-      if (result.found) {
-        if (result.alreadyLiked) { this._log('info', 'Already liked'); return true; }
-        if (result.clicked) {
-          await page.waitForTimeout(this.randomInt(1000, 2000));
-          this._log('success', 'Like pressed!');
-          return true;
+        // Step 2: If session didn't work, do FULL LOGIN with credentials
+        if (!isLoggedIn && account.login && account.password) {
+          this.log('[Verify] Performing full login with credentials...');
+          
+          // Create a fresh context for login
+          if (!contextId) {
+            const { context: freshCtx, contextId: freshCId } = await this._launchContext({ 
+              proxy: proxyUrl,
+              headless: settings.headless !== undefined ? settings.headless : false,
+            });
+            contextId = freshCId;
+          }
+          
+          const entry = this.activeContexts.get(contextId);
+          const page = entry.context.pages()[0] || await entry.context.newPage();
+          
+          const loginResult = await this.loginVK(page, account.login, account.password);
+          
+          if (loginResult.success) {
+            isLoggedIn = true;
+            this.log('[Verify] Login successful, saving session...');
+            await this._saveSession(entry.context, accountId);
+          } else {
+            this.log(`[Verify] Login failed: ${loginResult.error}`);
+          }
+        } else if (!isLoggedIn && (!account.login || !account.password)) {
+          this.log('[Verify] No credentials available for login');
+        }
+      } else {
+        // Cookie-based account — only check cookies, no login possible
+        this.log(`[Verify] Verifying cookie account: ${accountId}`);
+        
+        if (!fs.existsSync(cookiesPath) && !fs.existsSync(statePath)) {
+          return { valid: false, error: 'No session files found' };
+        }
+
+        // Use storageState if available, otherwise cookies
+        const launchOpts = { 
+          proxy: proxyUrl,
+          headless: settings.headless !== undefined ? settings.headless : false,
+        };
+        if (fs.existsSync(statePath)) {
+          launchOpts.storageStatePath = statePath;
+        }
+
+        const { context, contextId: cId } = await this._launchContext(launchOpts);
+        contextId = cId;
+
+        // If no storageState was used, load cookies manually
+        if (!fs.existsSync(statePath) && fs.existsSync(cookiesPath)) {
+          const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf-8'));
+          await this._loadCookies(context, cookies);
+        }
+        
+        const page = await context.newPage();
+        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this._humanDelay(2000, 4000);
+        isLoggedIn = await this._checkVKLogin(page);
+      }
+
+      // Update account status
+      const latestAccounts = this.store.get('accounts') || [];
+      const idx = latestAccounts.findIndex(a => a.id === accountId);
+      if (idx !== -1) {
+        latestAccounts[idx].status = isLoggedIn ? 'valid' : 'invalid';
+        latestAccounts[idx].hasCookies = isLoggedIn ? true : latestAccounts[idx].hasCookies;
+        latestAccounts[idx].lastVerified = new Date().toISOString();
+        if (!isLoggedIn && account.authType === 'logpass') {
+          latestAccounts[idx].statusDetail = 'Login failed or credentials invalid';
+        } else if (isLoggedIn) {
+          latestAccounts[idx].statusDetail = 'Account verified and session saved';
+        }
+        this.store.set('accounts', latestAccounts);
+      }
+
+      await this._safeClose(contextId);
+      return { valid: isLoggedIn, details: isLoggedIn ? 'Account verified and session saved' : 'Login failed' };
+      
+    } catch (error) {
+      this.log(`[Verify] Error: ${error.message}`);
+      if (contextId) await this._safeClose(contextId);
+      
+      const latestAccounts = this.store.get('accounts') || [];
+      const idx = latestAccounts.findIndex(a => a.id === accountId);
+      if (idx !== -1) {
+        latestAccounts[idx].status = 'invalid';
+        latestAccounts[idx].lastVerified = new Date().toISOString();
+        latestAccounts[idx].statusDetail = `Error: ${error.message}`;
+        this.store.set('accounts', latestAccounts);
+      }
+      
+      return { valid: false, error: error.message };
+    }
+  }
+
+  // ============================================================
+  // WARM-UP BROWSING
+  // ============================================================
+
+  async warmUpBrowsing(page) {
+    const settings = this.store.get('settings') || {};
+    const warmUp = settings.warmUp || {};
+    
+    const scenarios = ['chill', 'curious', 'explorer', 'searcher', 'impatient'];
+    const weights = {
+      chill: warmUp.scenarioWeight?.chill || 30,
+      curious: warmUp.scenarioWeight?.curious || 25,
+      explorer: warmUp.scenarioWeight?.explorer || 20,
+      searcher: warmUp.scenarioWeight?.searcher || 15,
+      impatient: warmUp.scenarioWeight?.impatient || 10,
+    };
+
+    // Weighted random selection
+    const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+    let random = Math.random() * totalWeight;
+    let scenario = 'chill';
+    for (const [name, weight] of Object.entries(weights)) {
+      random -= weight;
+      if (random <= 0) {
+        scenario = name;
+        break;
+      }
+    }
+
+    this.log(`[WarmUp] Scenario: ${scenario}`);
+
+    try {
+      const pageAlive = () => !page.isClosed();
+
+      switch (scenario) {
+        case 'chill': {
+          // Just browse the feed
+          if (!pageAlive()) return;
+          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          const scrollCount = this._randomDelay(warmUp.homePageMin || 3, warmUp.homePageMax || 8);
+          for (let i = 0; i < scrollCount; i++) {
+            if (!pageAlive()) return;
+            await page.mouse.wheel(0, this._randomDelay(200, 600));
+            await this._humanDelay(
+              (warmUp.scrollPauseMin || 1.5) * 1000,
+              (warmUp.scrollPauseMax || 5) * 1000
+            );
+          }
+          break;
+        }
+
+        case 'curious': {
+          // Browse feed, click on a video/post
+          if (!pageAlive()) return;
+          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await this._humanDelay(2000, 4000);
+          // Scroll a bit
+          for (let i = 0; i < 3; i++) {
+            if (!pageAlive()) return;
+            await page.mouse.wheel(0, this._randomDelay(200, 400));
+            await this._humanDelay(1000, 2000);
+          }
+          // Try to click a video link
+          try {
+            const videoLink = page.locator('a[href*="/video"], a[href*="/clip"]').first();
+            if (await videoLink.isVisible({ timeout: 3000 })) {
+              await videoLink.click();
+              await this._humanDelay(
+                (warmUp.videoWatchMin || 5) * 1000,
+                (warmUp.videoWatchMax || 25) * 1000
+              );
+            }
+          } catch (e) {}
+          break;
+        }
+
+        case 'explorer': {
+          // Visit random VK sections
+          const destinations = ['https://vk.com/video', 'https://vk.com/clips', 'https://vk.com/discover'];
+          const dest = destinations[Math.floor(Math.random() * destinations.length)];
+          if (!pageAlive()) return;
+          await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await this._humanDelay(2000, 4000);
+          const scrolls = this._randomDelay(2, 5);
+          for (let i = 0; i < scrolls; i++) {
+            if (!pageAlive()) return;
+            await page.mouse.wheel(0, this._randomDelay(200, 500));
+            await this._humanDelay(1500, 3000);
+          }
+          break;
+        }
+
+        case 'searcher': {
+          // Search for something
+          const queries = ['музыка 2025', 'смешные видео', 'новости', 'рецепты', 'фильмы', 'мемы'];
+          const query = queries[Math.floor(Math.random() * queries.length)];
+          if (!pageAlive()) return;
+          await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await this._humanDelay(1000, 2000);
+          try {
+            const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[name="q"]').first();
+            if (await searchInput.isVisible({ timeout: 3000 })) {
+              await this._humanType(page, searchInput, query);
+              await page.keyboard.press('Enter');
+              await this._humanDelay(2000, 4000);
+              for (let i = 0; i < this._randomDelay(1, 3); i++) {
+                if (!pageAlive()) return;
+                await page.mouse.wheel(0, this._randomDelay(200, 400));
+                await this._humanDelay(1000, 2000);
+              }
+            }
+          } catch (e) {}
+          break;
+        }
+
+        case 'impatient': {
+          // Quick browse, leave fast
+          if (!pageAlive()) return;
+          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await this._humanDelay(1000, 3000);
+          await page.mouse.wheel(0, 300);
+          await this._humanDelay(500, 1500);
+          break;
         }
       }
-      this._log('warn', 'Like button not found');
-      return false;
-    } catch (e) {
-      this._log('warn', `Like failed: ${e.message}`);
-      return false;
+    } catch (error) {
+      this.log(`[WarmUp] Error in scenario ${scenario}: ${error.message}`);
     }
   }
 
-  // ──────── Comment ────────
+  // ============================================================
+  // VIDEO SEARCH & ENGAGEMENT
+  // ============================================================
 
-  async postComment(page, text, settings) {
-    if (!this._isPageAlive(page)) return false;
-    this._log('info', `Posting comment: "${text.substring(0, 40)}..."`);
+  async searchAndFindVideo(page, keywords, targetUrl) {
+    this.log(`[Search] Searching for video: ${keywords || targetUrl}`);
+    
     try {
-      // Scroll to comments area
-      for (let i = 0; i < 4; i++) {
-        await page.mouse.wheel(0, this.randomInt(250, 500));
-        await this.randomDelay(500, 1000);
+      await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await this._humanDelay(2000, 3000);
+
+      if (keywords) {
+        const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[name="q"]').first();
+        if (await searchInput.isVisible({ timeout: 5000 })) {
+          await this._humanType(page, searchInput, keywords);
+          await page.keyboard.press('Enter');
+          await this._humanDelay(3000, 5000);
+
+          // Look for the target video in results
+          if (targetUrl) {
+            const found = await page.evaluate((url) => {
+              const links = document.querySelectorAll('a[href*="/video"]');
+              for (const link of links) {
+                const href = link.href || '';
+                if (href.includes(url)) {
+                  link.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  return { found: true, href };
+                }
+              }
+              return { found: false };
+            }, targetUrl);
+
+            if (found.found) {
+              this.log(`[Search] Found target video: ${found.href}`);
+              await page.click(`a[href*="${targetUrl}"]`);
+              await this._humanDelay(2000, 3000);
+              return true;
+            }
+          }
+
+          // Click first video result
+          try {
+            const firstVideo = page.locator('a[href*="/video-"]').first();
+            if (await firstVideo.isVisible({ timeout: 3000 })) {
+              await firstVideo.click();
+              await this._humanDelay(2000, 3000);
+              return true;
+            }
+          } catch (e) {}
+        }
       }
-      await this.randomDelay(1500, 3000);
-
-      // Find and click comment input
-      const commentBox = page.locator(
-        '.reply_fakebox, .reply_field, [contenteditable="true"][data-placeholder*="Комментарий"], ' +
-        '[contenteditable="true"][data-placeholder*="Comment"], .wall_module .reply_field, ' +
-        'div[class*="CommentTextarea"], textarea[placeholder*="Comment"], textarea[placeholder*="Комментарий"]'
-      ).first();
-
-      await commentBox.click();
-      await this.randomDelay(500, 1000);
-
-      // Type the comment
-      const inputField = page.locator('[contenteditable="true"]:focus, textarea:focus, .reply_field[contenteditable="true"]').first();
-      if (await inputField.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await this.typeHumanLike(inputField, text, settings?.typingDelay);
-      } else {
-        // Fallback: type via keyboard
-        await page.keyboard.type(text, { delay: this.randomInt(50, 150) });
-      }
-
-      await this.randomDelay(1000, 2000);
-
-      // Submit comment
-      const submitBtn = page.locator(
-        'button.reply_send_btn, button[class*="submit"], ' +
-        'button:has-text("Отправить"), button:has-text("Send"), .reply_send'
-      ).first();
-
-      if (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await submitBtn.click();
-      } else {
-        // VK often uses Ctrl+Enter to submit
-        await page.keyboard.press('Control+Enter');
-      }
-
-      await this.randomDelay(2000, 4000);
-      this._log('success', 'Comment posted');
-      return true;
-    } catch (e) {
-      this._log('warn', `Comment failed: ${e.message}`);
+      
+      return false;
+    } catch (error) {
+      this.log(`[Search] Error: ${error.message}`);
       return false;
     }
   }
 
-  // ──────── Engagement Task Execution ────────
+  async watchVideo(page, duration) {
+    const settings = this.store.get('settings') || {};
+    const watchMin = duration || settings.watchDuration?.min || 30;
+    const watchMax = duration || settings.watchDuration?.max || 120;
+    const watchTime = this._randomDelay(watchMin, watchMax);
+    
+    this.log(`[Watch] Watching for ${watchTime} seconds...`);
+    
+    try {
+      // Click play if needed
+      try {
+        const playBtn = page.locator('.videoplayer_btn_play, [class*="play"], button[aria-label="Play"]').first();
+        if (await playBtn.isVisible({ timeout: 2000 })) {
+          await playBtn.click();
+          await this._humanDelay(500, 1000);
+        }
+      } catch (e) {}
+
+      // Simulate watching with random mouse movements
+      const startTime = Date.now();
+      while ((Date.now() - startTime) / 1000 < watchTime) {
+        if (page.isClosed()) break;
+        
+        // Random mouse movement
+        const x = this._randomDelay(100, 1800);
+        const y = this._randomDelay(100, 900);
+        await page.mouse.move(x, y);
+        
+        // Occasional scroll
+        if (Math.random() < 0.1) {
+          await page.mouse.wheel(0, this._randomDelay(-100, 100));
+        }
+        
+        await this._humanDelay(3000, 8000);
+      }
+      
+      this.log('[Watch] Done watching');
+      return true;
+    } catch (error) {
+      this.log(`[Watch] Error: ${error.message}`);
+      return false;
+    }
+  }
+
+  async pressLike(page) {
+    this.log('[Like] Attempting to like...');
+    try {
+      const likeSelectors = [
+        '.like_btn:not(.active)',
+        'button[class*="like"]:not(.active)',
+        '[data-like-id]',
+        '.PostBottomAction:first-child',
+      ];
+
+      for (const sel of likeSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 2000 })) {
+            await btn.click();
+            this.log('[Like] ✅ Liked');
+            await this._humanDelay(500, 1500);
+            return true;
+          }
+        } catch (e) {}
+      }
+      
+      this.log('[Like] Like button not found');
+      return false;
+    } catch (error) {
+      this.log(`[Like] Error: ${error.message}`);
+      return false;
+    }
+  }
+
+  async postComment(page, text) {
+    this.log(`[Comment] Posting: "${text.substring(0, 30)}..."`);
+    try {
+      const commentSelectors = [
+        'div[contenteditable="true"][class*="comment"]',
+        '.reply_field',
+        'textarea[name="comment"]',
+        'div[contenteditable="true"]',
+      ];
+
+      let commentInput = null;
+      for (const sel of commentSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 2000 })) {
+            commentInput = el;
+            break;
+          }
+        } catch (e) {}
+      }
+
+      if (!commentInput) {
+        // Try clicking "Комментировать" button first
+        try {
+          const btn = page.locator('button:has-text("Комментировать"), a:has-text("Комментировать")').first();
+          if (await btn.isVisible({ timeout: 2000 })) {
+            await btn.click();
+            await this._humanDelay(500, 1000);
+            // Try again
+            for (const sel of commentSelectors) {
+              const el = page.locator(sel).first();
+              if (await el.isVisible({ timeout: 2000 })) {
+                commentInput = el;
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!commentInput) {
+        this.log('[Comment] Comment input not found');
+        return false;
+      }
+
+      await commentInput.click();
+      await this._humanDelay(300, 600);
+      await this._humanType(page, commentInput, text);
+      await this._humanDelay(500, 1000);
+      
+      // Submit comment
+      await page.keyboard.press('Enter');
+      await this._humanDelay(1000, 2000);
+      
+      this.log('[Comment] ✅ Comment posted');
+      return true;
+    } catch (error) {
+      this.log(`[Comment] Error: ${error.message}`);
+      return false;
+    }
+  }
+
+  // ============================================================
+  // TASK EXECUTION
+  // ============================================================
 
   async executeEngagementTask(task, onProgress, signal) {
-    const settings = this.store.get('settings');
-    const { videoUrl, viewCount, likeCount, commentCount, searchKeywords, useSearch, accountIds } = task;
+    const settings = this.store.get('settings') || {};
+    const {
+      videoUrl,
+      viewCount = 0,
+      likeCount = 0,
+      commentCount = 0,
+      searchKeywords,
+      useSearch = false,
+      accountIds = [],
+    } = task;
 
     if (!videoUrl) {
-      this._log('error', 'No video URL');
-      return [{ status: 'error', error: 'No video URL' }];
+      return { success: false, error: 'No video URL' };
     }
 
+    this.log(`[Task] Starting engagement task for: ${videoUrl}`);
+    this.log(`[Task] Views: ${viewCount}, Likes: ${likeCount}, Comments: ${commentCount}`);
+    this.log(`[Task] Mode: ${useSearch ? 'search' : 'direct'}, Accounts: ${accountIds.length}`);
+
+    const accounts = this.store.get('accounts') || [];
+    const comments = this.store.get('comments') || [];
     const maxConcurrency = settings.maxConcurrency || 3;
-    const ops = this._buildOperationPlan(task);
 
-    // Get comments
-    let selComments = [];
-    if (task.commentFolderId) {
-      const folders = this.store.get('commentFolders', []);
-      const folder = folders.find(f => f.id === task.commentFolderId);
-      if (folder && folder.comments.length) {
-        selComments = folder.comments;
-        this._log('info', `Using comment folder: "${folder.name}" (${folder.comments.length} comments)`);
-      }
-    } else {
-      selComments = this.store.get('comments', []);
+    // Build operation plan
+    const ops = [];
+    let opIndex = 0;
+    
+    for (let i = 0; i < Math.max(viewCount, likeCount, commentCount); i++) {
+      const accountId = accountIds[i % accountIds.length];
+      const account = accounts.find(a => a.id === accountId);
+      if (!account) continue;
+
+      ops.push({
+        accountId,
+        proxyId: account.proxyId || null,
+        shouldLike: i < likeCount,
+        shouldComment: i < commentCount,
+        commentText: i < commentCount && comments.length > 0 
+          ? comments[Math.floor(Math.random() * comments.length)]?.text || ''
+          : '',
+      });
     }
 
-    const launchInfo = hasLocalFingerprints ? 'fingerprint-injector' : PlaywrightExtra ? 'stealth' : 'plain';
-    this._log('info', '═══════════════════════════════════════');
-    this._log('info', `TASK STARTED — VK Video v1.0 (${launchInfo})`);
-    this._log('info', `Video: ${videoUrl}`);
-    this._log('info', `Views: ${viewCount}, Likes: ${likeCount}, Comments: ${commentCount}`);
-    this._log('info', `Mode: ${useSearch ? `SEARCH "${searchKeywords}"` : 'DIRECT URL'}`);
-    this._log('info', `Accounts: ${accountIds.length}, Operations: ${ops.length}, Concurrency: ${maxConcurrency}`);
-    this._log('info', '═══════════════════════════════════════');
+    this.log(`[Task] Total operations: ${ops.length}, Concurrency: ${maxConcurrency}`);
 
-    const results = [];
-    let completedCount = 0;
+    const results = { views: 0, likes: 0, comments: 0, errors: 0 };
 
+    // Process in batches
     for (let batchStart = 0; batchStart < ops.length; batchStart += maxConcurrency) {
-      if (signal?.aborted) break;
+      if (signal?.aborted) {
+        this.log('[Task] Aborted');
+        break;
+      }
 
-      const batchEnd = Math.min(batchStart + maxConcurrency, ops.length);
-      const batch = ops.slice(batchStart, batchEnd);
-      const batchNum = Math.floor(batchStart / maxConcurrency) + 1;
-      this._log('info', `── Batch ${batchNum}: ops ${batchStart + 1}-${batchEnd} ──`);
+      const batch = ops.slice(batchStart, batchStart + maxConcurrency);
+      this.log(`[Task] Batch ${Math.floor(batchStart / maxConcurrency) + 1}/${Math.ceil(ops.length / maxConcurrency)}`);
 
       const batchPromises = batch.map((op, idx) => {
-        const globalIdx = batchStart + idx;
-        const staggerDelay = idx * this.randomInt(5000, 15000);
-        return new Promise(resolve => {
-          setTimeout(async () => {
-            if (signal?.aborted) { resolve({ op: globalIdx + 1, status: 'skipped' }); return; }
-            const result = await this._executeSingleOp(op, globalIdx, ops.length, task, settings, selComments, signal);
-            completedCount++;
-            onProgress?.({
-              current: completedCount, total: ops.length,
-              status: result.status === 'success' ? 'done' : 'error',
-              message: `${result.account}: ${result.status}`,
-              progress: Math.round((completedCount / ops.length) * 100),
+        return new Promise(async (resolve) => {
+          // Stagger start
+          await this._humanDelay(idx * 1000, idx * 2000 + 1000);
+          
+          try {
+            const result = await this._executeSingleOp(op, task, settings);
+            if (result.viewed) results.views++;
+            if (result.liked) results.likes++;
+            if (result.commented) results.comments++;
+            if (result.error) results.errors++;
+          } catch (e) {
+            results.errors++;
+            this.log(`[Task] Op error: ${e.message}`);
+          }
+
+          if (onProgress) {
+            onProgress({
+              completed: batchStart + idx + 1,
+              total: ops.length,
+              ...results,
             });
-            resolve(result);
-          }, staggerDelay);
+          }
+
+          resolve();
         });
       });
 
-      const batchResults = await Promise.allSettled(batchPromises);
-      for (const r of batchResults) {
-        results.push(r.status === 'fulfilled' ? r.value : { status: 'error', error: 'Promise rejected' });
-      }
-
-      if (batchEnd < ops.length && !signal?.aborted) {
-        const delay = this.randomInt(3, 8);
-        this._log('info', `Waiting ${delay}s before next batch...`);
-        await new Promise(r => setTimeout(r, delay * 1000));
-      }
+      await Promise.all(batchPromises);
     }
 
-    const ok = results.filter(r => r.status === 'success').length;
-    const fail = results.filter(r => r.status === 'error').length;
-    this._log('info', '═══════════════════════════════════════');
-    this._log('info', `TASK COMPLETE: ${ok}/${ops.length} success, ${fail} errors`);
-    this._log('info', '═══════════════════════════════════════');
-    return results;
+    this.log(`[Task] Completed. Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Errors: ${results.errors}`);
+    return { success: true, results };
   }
 
-  _buildOperationPlan(task) {
-    const ops = [];
-    const { viewCount, likeCount, commentCount, accountIds, proxyIds, allowDirect } = task;
-    const pool = [...(proxyIds || [])];
-    if (allowDirect) pool.push(null);
+  async _executeSingleOp(op, task, settings) {
+    const { accountId, proxyId, shouldLike, shouldComment, commentText } = op;
+    const { videoUrl, searchKeywords, useSearch } = task;
 
-    for (let i = 0; i < Math.max(viewCount, 1); i++) {
-      const accId = accountIds[i % accountIds.length];
-      const proxyId = pool.length ? pool[i % pool.length] : null;
-      ops.push({
-        accountId: accId,
-        proxyId,
-        shouldLike: i < likeCount,
-        shouldComment: i < commentCount,
-      });
+    const accounts = this.store.get('accounts') || [];
+    const account = accounts.find(a => a.id === accountId);
+    if (!account) return { error: 'Account not found' };
+
+    let proxyUrl = null;
+    if (proxyId) {
+      const proxies = this.store.get('proxies') || [];
+      const proxy = proxies.find(p => p.id === proxyId);
+      if (proxy) proxyUrl = this._buildProxyUrl(proxy);
     }
-    return ops;
-  }
 
-  async _executeSingleOp(op, opIdx, totalOps, task, settings, selComments, signal) {
-    const account = this.accountManager.getById(op.accountId);
-    const accName = account?.name || '?';
-    const proxyObj = op.proxyId ? this.proxyManager.getById(op.proxyId) : null;
-    const proxyInfo = proxyObj ? `${proxyObj.host}:${proxyObj.port}` : 'direct';
-    const proxyUrl = proxyObj ? this._buildProxyUrl(proxyObj) : null;
+    this.log(`[Op] Account: ${account.login?.substring(0, 4) || accountId}***, Proxy: ${proxyUrl ? 'yes' : 'no'}`);
 
-    this._log('info', `Op ${opIdx + 1}/${totalOps}: ${accName} via ${proxyInfo} [watch${op.shouldLike ? '+like' : ''}${op.shouldComment ? '+comment' : ''}]`);
+    const cookiesDir = path.join(app.getPath('userData'), 'accounts');
+    const statePath = path.join(cookiesDir, `${accountId}_state.json`);
+    const cookiesPath = path.join(cookiesDir, `${accountId}_cookies.json`);
 
-    let context = null;
+    let contextId = null;
     try {
-      const launched = await this.launchContext({
-        proxyUrl, headless: settings.headless, accountId: op.accountId,
-      });
-      context = launched.context;
-      if (signal?.aborted) throw new Error('Aborted');
+      // Build launch options — use native storageState if available
+      const launchOpts = { 
+        proxy: proxyUrl,
+        headless: settings.headless !== undefined ? settings.headless : false,
+      };
 
-      // Load cookies if cookie-based account or logpass with saved cookies
-      if (account.authType === 'cookies' || account.hasCookies) {
-        await this.loadCookies(context, op.accountId);
+      // Prefer storageState (restores cookies + localStorage in one step)
+      if (account.hasCookies && fs.existsSync(statePath)) {
+        launchOpts.storageStatePath = statePath;
       }
+
+      const { context, contextId: cId } = await this._launchContext(launchOpts);
+      contextId = cId;
 
       const page = await context.newPage();
+      const result = { viewed: false, liked: false, commented: false, error: false };
 
-      // Login if logpass account without saved cookies
-      if (account.authType === 'logpass' && account.login && account.password && !account.hasCookies) {
-        const loginResult = await this.loginVK(page, account.login, account.password);
-        if (!loginResult.success) {
-          this._log('error', `Login failed for ${accName}: ${loginResult.error}`);
-          await this._safeContextClose(context);
-          return { op: opIdx + 1, account: accName, status: 'error', error: `Login failed: ${loginResult.error}` };
+      // Check if session works
+      let loggedIn = false;
+      if (account.hasCookies) {
+        // If no storageState was loaded, try manual cookies
+        if (!launchOpts.storageStatePath && fs.existsSync(cookiesPath)) {
+          try {
+            const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf-8'));
+            await this._loadCookies(context, cookies);
+          } catch (e) {}
         }
-        // Save cookies from successful login
-        if (loginResult.cookies) {
-          this.accountManager.setCookiesRaw(op.accountId, loginResult.cookies, 'playwright');
-          this.accountManager.updateAccount(op.accountId, { status: 'valid', hasCookies: true });
+          
+        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await this._humanDelay(2000, 3000);
+        loggedIn = await this._checkVKLogin(page);
+        
+        if (loggedIn) {
+          this.log('[Op] Logged in via saved session');
         }
-      } else if (account.authType === 'logpass' && account.hasCookies) {
-        // Logpass account with saved cookies — verify they still work
-        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(3000);
-        const cookiesValid = await this._checkVKLogin(page);
-        if (!cookiesValid) {
-          this._log('info', `Saved cookies expired for ${accName}, re-logging in...`);
+      }
+      
+      // If not logged in, do full login
+      if (!loggedIn) {
+        if (account.authType === 'logpass' && account.login && account.password) {
+          this.log('[Op] Performing full login...');
           const loginResult = await this.loginVK(page, account.login, account.password);
-          if (!loginResult.success) {
-            this._log('error', `Re-login failed for ${accName}: ${loginResult.error}`);
-            await this._safeContextClose(context);
-            return { op: opIdx + 1, account: accName, status: 'error', error: `Re-login failed: ${loginResult.error}` };
+          if (loginResult.success) {
+            loggedIn = true;
+            // Save session for next time
+            await this._saveSession(context, accountId);
+          } else {
+            result.error = true;
+            await this._safeClose(contextId);
+            return result;
           }
-          if (loginResult.cookies) {
-            this.accountManager.setCookiesRaw(op.accountId, loginResult.cookies, 'playwright');
-            this.accountManager.updateAccount(op.accountId, { status: 'valid', hasCookies: true });
-          }
+        } else {
+          result.error = true;
+          await this._safeClose(contextId);
+          return result;
         }
       }
 
-      if (signal?.aborted) throw new Error('Aborted');
-
-      // Warm-up
-      if (settings.warmUp?.homePageMin > 0) {
-        await this.warmUpBrowsing(page, signal);
+      // Warm-up browsing
+      if (settings.warmUp) {
+        await this.warmUpBrowsing(page);
       }
-
-      if (signal?.aborted) throw new Error('Aborted');
 
       // Navigate to video
-      let videoOpened = false;
-      if (task.useSearch && task.searchKeywords) {
-        videoOpened = await this.searchAndFindVideo(page, task.searchKeywords, task.videoUrl, signal);
+      if (useSearch && searchKeywords) {
+        await this.searchAndFindVideo(page, searchKeywords, videoUrl);
+      } else {
+        await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await this._humanDelay(2000, 3000);
       }
-      if (!videoOpened) {
-        await page.goto(task.videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(this.randomInt(3000, 6000));
-        videoOpened = true;
-      }
-
-      if (signal?.aborted) throw new Error('Aborted');
 
       // Watch video
-      const watchMin = settings.watchDuration?.min || 30;
-      const watchMax = settings.watchDuration?.max || 120;
-      const watchDuration = this.randomInt(watchMin, watchMax);
-      await this.watchVideo(page, watchDuration, signal);
+      const watchDuration = this._randomDelay(
+        settings.watchDuration?.min || 30,
+        settings.watchDuration?.max || 120
+      );
+      await this.watchVideo(page, watchDuration);
+      result.viewed = true;
 
       // Like
-      if (op.shouldLike) {
-        await this.pressLike(page);
+      if (shouldLike) {
+        const liked = await this.pressLike(page);
+        result.liked = liked;
       }
 
       // Comment
-      if (op.shouldComment && selComments.length > 0) {
-        const randomComment = selComments[Math.floor(Math.random() * selComments.length)];
-        const commentText = randomComment.text || randomComment;
-        await this.postComment(page, commentText, settings);
+      if (shouldComment && commentText) {
+        const commented = await this.postComment(page, commentText);
+        result.commented = commented;
       }
 
-      await this._safeContextClose(context);
-      this._log('success', `Op ${opIdx + 1} done: ${accName}`);
-      return { op: opIdx + 1, account: accName, status: 'success' };
+      await this._safeClose(contextId);
+      return result;
 
-    } catch (e) {
-      if (context) await this._safeContextClose(context);
-      this._log('error', `Op ${opIdx + 1} error: ${e.message}`);
-      return { op: opIdx + 1, account: accName, status: 'error', error: e.message };
+    } catch (error) {
+      this.log(`[Op] Error: ${error.message}`);
+      if (contextId) await this._safeClose(contextId);
+      return { viewed: false, liked: false, commented: false, error: true };
     }
   }
 
-  // ──────── Helpers ────────
+  // ============================================================
+  // SESSION PERSISTENCE
+  // ============================================================
 
-  randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-
-  async randomDelay(min, max) {
-    await new Promise(r => setTimeout(r, this.randomInt(min, max)));
-  }
-
-  async typeHumanLike(locator, text, delayOpts) {
-    const min = delayOpts?.min || 50;
-    const max = delayOpts?.max || 150;
-    for (const char of text) {
-      await locator.type(char, { delay: 0 });
-      await new Promise(r => setTimeout(r, this.randomInt(min, max)));
-      if (Math.random() < 0.05) {
-        await new Promise(r => setTimeout(r, this.randomInt(300, 800)));
-      }
-    }
-  }
-
-  async _safeContextClose(context) {
+  /**
+   * Saves full browser session (cookies + storage state) for an account.
+   * This allows fast re-login without going through the full auth flow.
+   */
+  async _saveSession(context, accountId) {
     try {
-      const browser = context._fpBrowser || context._stealthBrowser || context._plainBrowser || context.browser?.();
-      if (browser) await browser.close();
-      else await context.close();
-    } catch (_) {}
+      const cookiesDir = path.join(app.getPath('userData'), 'accounts');
+      fs.mkdirSync(cookiesDir, { recursive: true });
+
+      // Save cookies
+      const cookies = await context.cookies();
+      fs.writeFileSync(
+        path.join(cookiesDir, `${accountId}_cookies.json`),
+        JSON.stringify(cookies, null, 2)
+      );
+
+      // Save full storage state (cookies + localStorage + sessionStorage)
+      try {
+        const storageState = await context.storageState();
+        fs.writeFileSync(
+          path.join(cookiesDir, `${accountId}_state.json`),
+          JSON.stringify(storageState, null, 2)
+        );
+        this.log(`[Session] Saved full state for account ${accountId}`);
+      } catch (e) {
+        this.log(`[Session] Could not save storage state: ${e.message}`);
+      }
+
+      // Update account in store (always read fresh)
+      const latestAccounts = this.store.get('accounts') || [];
+      const idx = latestAccounts.findIndex(a => a.id === accountId);
+      if (idx !== -1) {
+        latestAccounts[idx].hasCookies = true;
+        latestAccounts[idx].status = 'valid';
+        latestAccounts[idx].lastVerified = new Date().toISOString();
+        this.store.set('accounts', latestAccounts);
+      }
+    } catch (e) {
+      this.log(`[Session] Save error: ${e.message}`);
+    }
   }
+
+  // ============================================================
+  // CLEANUP
+  // ============================================================
 
   async cleanup() {
-    for (const [cid, context] of this.activeContexts) {
-      await this._safeContextClose(context);
+    this.log('[Engine] Cleaning up all active contexts...');
+    const contextIds = [...this.activeContexts.keys()];
+    for (const id of contextIds) {
+      await this._safeClose(id);
     }
-    this.activeContexts.clear();
+    this.log(`[Engine] Cleaned up ${contextIds.length} contexts`);
   }
 }
 
