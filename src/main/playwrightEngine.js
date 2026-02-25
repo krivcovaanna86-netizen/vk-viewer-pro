@@ -7,6 +7,8 @@
  */
 
 const { chromium } = require('playwright-core');
+const { FingerprintGenerator } = require('fingerprint-generator');
+const { FingerprintInjector } = require('fingerprint-injector');
 const path = require('path');
 const fs = require('fs');
 const { app } = require('electron');
@@ -96,15 +98,40 @@ class PlaywrightEngine {
     const headless = options.headless !== undefined ? options.headless : (settings.headless !== undefined ? settings.headless : false);
     const stealth = settings.stealth !== undefined ? settings.stealth : true;
     
+    // ── Generate fingerprint ──
+    let fingerprint = null;
+    let fingerprintData = null;
+    try {
+      const generator = new FingerprintGenerator();
+      fingerprint = generator.getFingerprint({
+        browsers: ['chrome'],
+        operatingSystems: ['windows'],
+        devices: ['desktop'],
+        locales: ['ru-RU', 'ru'],
+      });
+      fingerprintData = fingerprint.fingerprint;
+      this.log(`[Engine] Generated fingerprint: ${fingerprintData.navigator?.userAgent?.substring(0, 60)}...`);
+    } catch (e) {
+      this.log(`[Engine] Fingerprint generation failed: ${e.message}`);
+    }
+
     const launchOpts = {
       headless,
       args: [
         '--disable-blink-features=AutomationControlled',
         '--disable-dev-shm-usage',
         '--no-sandbox',
-        '--disable-gpu',
         '--window-size=1920,1080',
         '--lang=ru-RU',
+        // ── Media / Video playback flags ──
+        '--autoplay-policy=no-user-gesture-required',
+        '--enable-features=VaapiVideoDecoder,VaapiVideoEncoder',
+        '--use-gl=angle',
+        '--enable-gpu-rasterization',
+        '--enable-accelerated-video-decode',
+        '--ignore-gpu-blocklist',
+        // ── DRM (Widevine) for protected content ──
+        '--enable-features=CdmHostVerification',
       ],
     };
 
@@ -137,11 +164,16 @@ class PlaywrightEngine {
       this.log('[Engine] Launched plain (fallback)');
     }
 
-    // Build context options — use Playwright's native storageState if provided
+    // ── Build context options ──
     const contextOpts = {
       viewport: { width: 1920, height: 1080 },
       locale: 'ru-RU',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      // Use fingerprint UA or a current realistic one
+      userAgent: fingerprintData?.navigator?.userAgent 
+        || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      // Permissions needed for media playback
+      permissions: ['geolocation'],
+      bypassCSP: true,
     };
 
     // Load storage state natively — this restores cookies + localStorage in one step
@@ -157,6 +189,26 @@ class PlaywrightEngine {
     }
 
     const context = await browser.newContext(contextOpts);
+
+    // ── Inject fingerprint into context ──
+    if (fingerprint) {
+      try {
+        const injector = new FingerprintInjector();
+        await injector.attachFingerprintToPlaywright(context, fingerprint);
+        this.log('[Engine] Fingerprint injected into context');
+      } catch (e) {
+        this.log(`[Engine] Fingerprint injection failed: ${e.message}`);
+      }
+    }
+
+    // ── Block known tracking/error endpoints that cause console noise ──
+    try {
+      await context.route('**/stats.vk-portal.net/**', route => route.abort());
+      await context.route('**/sentry.mvk.com/**', route => route.abort());
+      await context.route('**/top-fwz1.mail.ru/**', route => route.abort());
+    } catch (e) {
+      this.log(`[Engine] Route blocking failed: ${e.message}`);
+    }
 
     const contextId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
     this.activeContexts.set(contextId, { browser, context });
@@ -923,128 +975,58 @@ class PlaywrightEngine {
 
   /**
    * Handles the "Выберите способ подтверждения" popup.
-   * This popup appears after clicking "Подтвердить другим способом".
-   * 
-   * CRITICAL: Must click "Пароль" / "Password" option — NOT just close!
-   * The popup offers: QR code, SMS code, Password, Restore access
-   * 
-   * Based on Python ref: XPath search for elements containing 'password'/'паролю'
-   * with filter to exclude 'confirm' and 'other' text.
+   * Clicks [data-test-id="verificationMethod_password"] or falls back to text search.
    */
   async _selectPasswordInPopup(page) {
     this.log('[VK Login] Looking for password option in popup...');
-    
-    // Approach 1: Evaluate (Python ref pattern — most reliable)
-    // Python ref: finds elements with text 'password'/'паролю', excludes 'confirm'/'other'
+
+    // Primary: data-test-id (from codegen)
+    try {
+      const pwdMethod = page.locator('[data-test-id="verificationMethod_password"]');
+      if (await pwdMethod.isVisible({ timeout: 3000 })) {
+        await pwdMethod.click();
+        this.log('[VK Login] Clicked [data-test-id="verificationMethod_password"]');
+        await this._humanDelay(1500, 2500);
+        return true;
+      }
+    } catch (e) {}
+
+    // Fallback: text-based search in modal/popup
     try {
       const clicked = await page.evaluate(() => {
-        const passwordTexts = ['password', 'паролю', 'пароль', 'account password', 'введите пароль', 'по паролю'];
-        const excludeTexts = ['confirm', 'other', 'подтвердить', 'другим'];
+        const passwordTexts = ['пароль', 'password', 'по паролю', 'account password'];
+        const excludeTexts = ['подтвердить', 'другим', 'confirm', 'other', 'введите пароль'];
         
-        // Search all visible elements with password text
-        const allEls = document.querySelectorAll('*');
-        for (const el of allEls) {
-          if (el.offsetParent === null) continue;
-          if (!el.isConnected) continue;
-          
-          const text = (el.textContent || '').toLowerCase().trim();
-          if (text.length > 80 || text.length === 0) continue;
-          
-          // Must contain a password-related text
-          const hasPassword = passwordTexts.some(p => text.includes(p));
-          if (!hasPassword) continue;
-          
-          // Must NOT contain exclude texts (to avoid clicking "Confirm using other method")
-          const hasExclude = excludeTexts.some(e => text.includes(e));
-          if (hasExclude) continue;
-          
-          // Prefer leaf-ish elements (not too many children)
-          const childCount = el.children.length;
-          if (childCount > 10) continue;
-          
-          try {
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            el.click();
-            return `Clicked: "${text.substring(0, 60)}" (${el.tagName})`;
-          } catch (e) {
-            continue;
-          }
-        }
+        const containers = document.querySelectorAll(
+          '[role="dialog"], [class*="modal"], [class*="popup"], [class*="bottomSheet"], [class*="ActionSheet"], [class*="sheet"]'
+        );
+        const searchIn = containers.length > 0 ? containers : [document.body];
         
-        // Fallback: look specifically in dialog/modal containers
-        const containers = document.querySelectorAll('[role="dialog"], [class*="modal"], [class*="popup"], [class*="bottomSheet"], [class*="ActionSheet"], [class*="sheet"]');
-        for (const container of containers) {
+        for (const container of searchIn) {
           const elements = container.querySelectorAll('div, span, a, button, li, [role="button"], [role="option"]');
           for (const el of elements) {
+            if (el.offsetParent === null) continue;
             const text = (el.textContent || '').toLowerCase().trim();
-            if (text.length > 100) continue;
-            if (passwordTexts.some(p => text.includes(p)) && el.offsetParent !== null) {
-              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              el.click();
-              return `Clicked in modal: "${text.substring(0, 60)}"`;
-            }
+            if (text.length > 60 || text.length === 0) continue;
+            if (el.children.length > 10) continue;
+            
+            const hasPassword = passwordTexts.some(p => text.includes(p));
+            if (!hasPassword) continue;
+            const hasExclude = excludeTexts.some(e => text.includes(e));
+            if (hasExclude) continue;
+            
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.click();
+            return text.substring(0, 50);
           }
         }
-        
         return null;
       });
       
       if (clicked) {
-        this.log(`[VK Login] ${clicked}`);
+        this.log(`[VK Login] Clicked password option: "${clicked}"`);
         await this._humanDelay(1500, 2500);
         return true;
-      }
-    } catch (e) {
-      this.log(`[VK Login] Evaluate error: ${e.message}`);
-    }
-
-    // Approach 2: Playwright locators
-    const passwordTexts = ['пароль', 'password', 'account password'];
-    for (const text of passwordTexts) {
-      try {
-        const selectors = [
-          `span:has-text("${text}")`,
-          `div:has-text("${text}")`,
-          `a:has-text("${text}")`,
-          `button:has-text("${text}")`,
-          `[role="button"]:has-text("${text}")`,
-          `li:has-text("${text}")`,
-        ];
-        for (const sel of selectors) {
-          try {
-            const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 800 })) {
-              const elText = await el.textContent().catch(() => '');
-              if (elText && elText.toLowerCase().includes(text) && elText.length < 80) {
-                // Exclude "confirm using other" matches
-                const lower = elText.toLowerCase();
-                if (lower.includes('confirm') || lower.includes('other') || lower.includes('подтвердить') || lower.includes('другим')) continue;
-                await el.click();
-                this.log(`[VK Login] Clicked password option: "${elText.trim().substring(0, 50)}"`);
-                await this._humanDelay(1500, 2500);
-                return true;
-              }
-            }
-          } catch (e) {}
-        }
-      } catch (e) {}
-    }
-
-    // Approach 3: Keyboard navigation
-    try {
-      for (let i = 0; i < 5; i++) {
-        await page.keyboard.press('Tab');
-        await this._humanDelay(300, 500);
-        const focusedText = await page.evaluate(() => {
-          const el = document.activeElement;
-          return el ? (el.textContent || '').toLowerCase().trim() : '';
-        }).catch(() => '');
-        if (passwordTexts.some(t => focusedText.includes(t))) {
-          await page.keyboard.press('Enter');
-          this.log('[VK Login] Selected password via keyboard navigation');
-          await this._humanDelay(1500, 2500);
-          return true;
-        }
       }
     } catch (e) {}
 
@@ -1053,133 +1035,84 @@ class PlaywrightEngine {
   }
 
   /**
-   * Dismisses generic confirmation/info popups (e.g., "Закрыть" buttons)
-   * Used as a fallback after other handlers
-   */
-  async _dismissConfirmationPopup(page) {
-    try {
-      const closeTexts = ['закрыть', 'close', 'отмена', 'cancel', 'не сейчас', 'not now', 'позже', 'later'];
-      
-      const closed = await page.evaluate((texts) => {
-        const elements = document.querySelectorAll('button, a, span, [role="button"]');
-        for (const el of elements) {
-          const text = (el.textContent || '').toLowerCase().trim();
-          if (texts.some(t => text === t || text.includes(t)) && el.offsetParent !== null && text.length < 30) {
-            el.click();
-            return true;
-          }
-        }
-        return false;
-      }, closeTexts);
-
-      if (closed) {
-        this.log('[VK Login] Dismissed popup');
-        await this._humanDelay(500, 1000);
-        return true;
-      }
-    } catch (e) {}
-    return false;
-  }
-
-  /**
-   * Handles post-login popups that VK may show:
-   * - "Вы создаёте аккаунт ВКонтакте" (You're creating a VK account)
-   * - "Подтвердите действие" (Confirm action)
-   * - "Добро пожаловать" (Welcome)
-   * - Cookie consent, notification permissions, etc.
+   * Handles post-login popups: VK may show "Продолжить" multiple times
+   * (account creation, welcome, cookie consent, etc.)
    * 
-   * Strategy: detect popup text, click appropriate button (usually "Продолжить"/"Continue"
-   * or "Нет"/"У меня уже есть аккаунт" for registration prompts).
-   * Runs up to 3 passes to handle chained popups.
+   * From codegen recording:
+   *   await page.getByRole('button', { name: 'Продолжить' }).click();  // x3
+   * 
+   * Runs up to 5 passes to handle chained popups.
    */
   async _handlePostLoginPopups(page) {
-    for (let pass = 0; pass < 3; pass++) {
-      const popupAction = await page.evaluate(() => {
-        const body = (document.body?.innerText || '').toLowerCase();
-        const url = (window.location.href || '').toLowerCase();
+    for (let pass = 0; pass < 5; pass++) {
+      if (await this._checkVKLogin(page)) {
+        this.log('[VK Login] Logged in, stopping popup handler');
+        break;
+      }
 
-        // Registration prompt: "Вы создаёте аккаунт" — we do NOT want to register
-        const isRegistration = body.includes('создаёте аккаунт') || body.includes('создаете аккаунт') ||
-                               body.includes('creating an account') || body.includes('регистрац') ||
-                               body.includes('create a new') || body.includes('новый аккаунт') ||
-                               url.includes('join') || url.includes('register') || url.includes('signup');
-        
-        if (isRegistration) {
-          // Try to find "Нет" / "У меня уже есть аккаунт" / "Назад" / "Back" buttons
-          const cancelTexts = [
-            'у меня уже есть', 'уже есть аккаунт', 'уже зарегистрирован',
-            'i already have', 'already registered',
-            'назад', 'back', 'нет', 'отмена', 'cancel', 'вернуться',
-          ];
-          const btns = document.querySelectorAll('button, a, span, [role="button"]');
-          for (const btn of btns) {
-            const txt = (btn.textContent || '').toLowerCase().trim();
-            if (txt.length > 60 || txt.length === 0) continue;
-            if (btn.offsetParent === null || btn.disabled) continue;
-            if (cancelTexts.some(ct => txt.includes(ct))) {
-              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              btn.click();
-              return 'cancel_registration';
-            }
-          }
-          // If no cancel button — sometimes "Продолжить" is the only way forward
-          for (const btn of btns) {
-            const txt = (btn.textContent || '').toLowerCase().trim();
-            if (txt.length > 30) continue;
-            if (btn.offsetParent === null || btn.disabled) continue;
-            if (txt.includes('продолжить') || txt.includes('continue')) {
-              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              btn.click();
-              return 'continue_registration';
-            }
-          }
-          return 'registration_no_button';
+      let clicked = false;
+
+      // Primary: "Продолжить" button by role (exactly what codegen recorded)
+      try {
+        const continueBtn = page.getByRole('button', { name: 'Продолжить' });
+        if (await continueBtn.isVisible({ timeout: 2000 })) {
+          await continueBtn.click();
+          this.log(`[VK Login] Post-login popup: clicked "Продолжить" (pass ${pass + 1})`);
+          clicked = true;
         }
+      } catch (e) {}
 
-        // Generic confirmation / welcome / info popup — just click through
-        const isConfirmation = body.includes('подтвердите') || body.includes('confirm') ||
-                               body.includes('добро пожаловать') || body.includes('welcome') ||
-                               body.includes('разрешить') || body.includes('allow');
+      // Fallback: try other common popup buttons
+      if (!clicked) {
+        const popupResult = await page.evaluate(() => {
+          const body = (document.body?.innerText || '').toLowerCase();
+          const url = (window.location.href || '').toLowerCase();
 
-        if (isConfirmation) {
+          const isRegistration = body.includes('создаёте аккаунт') || body.includes('создаете аккаунт') ||
+                                 body.includes('creating an account') || url.includes('join') || url.includes('register');
+
+          if (isRegistration) {
+            const cancelTexts = ['у меня уже есть', 'уже есть аккаунт', 'i already have', 'назад', 'back'];
+            const btns = document.querySelectorAll('button, a, span, [role="button"]');
+            for (const btn of btns) {
+              const txt = (btn.textContent || '').toLowerCase().trim();
+              if (txt.length > 60 || btn.offsetParent === null || btn.disabled) continue;
+              if (cancelTexts.some(ct => txt.includes(ct))) { btn.click(); return 'cancel_registration'; }
+            }
+          }
+
           const confirmTexts = [
-            'продолжить', 'continue', 'подтвердить', 'confirm',
-            'ок', 'ok', 'готово', 'done', 'далее', 'next',
-            'принять', 'accept', 'разрешить', 'allow',
+            'продолжить', 'continue', 'ок', 'ok', 'готово', 'done',
+            'далее', 'next', 'принять', 'accept', 'разрешить', 'allow',
           ];
           const btns = document.querySelectorAll('button, a, [role="button"]');
           for (const btn of btns) {
             const txt = (btn.textContent || '').toLowerCase().trim();
-            if (txt.length > 30) continue;
-            if (btn.offsetParent === null || btn.disabled) continue;
-            if (confirmTexts.some(ct => txt.includes(ct))) {
-              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              btn.click();
-              return 'confirmed';
+            if (txt.length > 30 || btn.offsetParent === null || btn.disabled) continue;
+            if (confirmTexts.some(ct => txt.includes(ct))) { btn.click(); return 'confirmed'; }
+          }
+
+          if (body.includes('cookie')) {
+            for (const btn of btns) {
+              const txt = (btn.textContent || '').toLowerCase().trim();
+              if ((txt.includes('принять') || txt.includes('accept')) && btn.offsetParent !== null) {
+                btn.click();
+                return 'cookie_accepted';
+              }
             }
           }
-          return 'confirmation_no_button';
+
+          return null;
+        }).catch(() => null);
+
+        if (popupResult) {
+          this.log(`[VK Login] Post-login popup: ${popupResult} (pass ${pass + 1})`);
+          clicked = true;
         }
+      }
 
-        // Cookie consent
-        const isCookieConsent = body.includes('cookie') && (body.includes('принять') || body.includes('accept'));
-        if (isCookieConsent) {
-          const btns = document.querySelectorAll('button, a, [role="button"]');
-          for (const btn of btns) {
-            const txt = (btn.textContent || '').toLowerCase().trim();
-            if ((txt.includes('принять') || txt.includes('accept') || txt.includes('ок') || txt.includes('ok')) && btn.offsetParent !== null) {
-              btn.click();
-              return 'cookie_accepted';
-            }
-          }
-        }
+      if (!clicked) break;
 
-        return null; // No popup detected
-      }).catch(() => null);
-
-      if (!popupAction) break; // No popups left
-
-      this.log(`[VK Login] Post-login popup handled: ${popupAction}`);
       await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
       await this._humanDelay(1500, 2500);
     }
@@ -1187,155 +1120,94 @@ class PlaywrightEngine {
 
   /**
    * Handles robot challenge: "Проверяем, что вы не робот"
-   * Based on Python ref: is_robot_check_visible + click_robot_check_continue + dismiss_robot_check
    * Returns true if a robot challenge was found and handled.
    */
   async _handleRobotChallenge(page) {
-    const maxAttempts = 3;
-    
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // Check if we're actually on a robot challenge page (not just any page with "robot" word)
-      const robotInfo = await page.evaluate(() => {
-        const url = (window.location.href || '').toLowerCase();
-        const body = (document.body?.innerText || '').toLowerCase();
-        
-        // Must be on a challenge/captcha page, not just any page
-        const isChallengePage = url.includes('challenge') || url.includes('captcha') || url.includes('not_robot');
-        const hasRobotCheck = body.includes('проверяем, что вы не робот') || body.includes('checking that you are not a robot');
-        // Generic "robot" text check — but only if it's prominent (short context)
-        const bodyLines = body.split('\n').filter(l => l.trim());
-        const hasRobotLine = bodyLines.some(l => l.length < 100 && (l.includes('робот') || l.includes('robot')));
-        
-        return {
-          isRobot: isChallengePage || hasRobotCheck || hasRobotLine,
-          isChallengePage,
-          hasRobotCheck,
-        };
-      }).catch(() => ({ isRobot: false }));
+    const isChallenge = await page.evaluate(() => {
+      const url = (window.location.href || '').toLowerCase();
+      const body = (document.body?.innerText || '').toLowerCase();
+      const hasChallenge = url.includes('challenge') || url.includes('captcha') || url.includes('not_robot');
+      const hasRobotText = body.includes('проверяем, что вы не робот') || body.includes('checking that you are not a robot');
+      return hasChallenge || hasRobotText;
+    }).catch(() => false);
 
-      if (!robotInfo.isRobot) return false;
+    if (!isChallenge) return false;
 
-      this.log(`[VK Login] Robot challenge detected (attempt ${attempt + 1}/${maxAttempts})`);
+    this.log('[VK Login] Robot challenge detected');
 
-      let clicked = false;
-      
-      // 1. Click "Продолжить" / "Continue" ONLY on robot challenge pages
-      try {
-        clicked = await page.evaluate(() => {
-          const btns = document.querySelectorAll('button, *[role="button"]');
-          for (const el of btns) {
-            const text = (el.textContent || '').toLowerCase().trim();
-            if (text.length > 30) continue;
-            if ((text.includes('продолжить') || text.includes('continue') || text.includes('начать') || text.includes('start')) 
-                && el.offsetParent !== null && !el.disabled) {
-              el.scrollIntoView();
-              el.click();
-              return true;
-            }
+    let clicked = false;
+    try {
+      clicked = await page.evaluate(() => {
+        const btns = document.querySelectorAll('button, [role="button"]');
+        for (const el of btns) {
+          const text = (el.textContent || '').toLowerCase().trim();
+          if (text.length > 30) continue;
+          if ((text.includes('продолжить') || text.includes('continue') || text.includes('начать') || text.includes('start'))
+              && el.offsetParent !== null && !el.disabled) {
+            el.click();
+            return true;
           }
-          return false;
-        });
-      } catch (e) {}
+        }
+        return false;
+      });
+    } catch (e) {}
 
-      // 2. CSS selectors for robot challenge buttons
-      if (!clicked) {
-        const cssSelectors = ['body > div > button.start', 'button.start', 'button[type="submit"]'];
-        for (const sel of cssSelectors) {
+    if (!clicked) {
+      await this._clickNotRobotCheckbox(page);
+    }
+
+    if (!clicked) {
+      try {
+        for (const frame of page.frames()) {
+          const frameUrl = frame.url().toLowerCase();
+          if (!frameUrl.includes('turnstile') && !frameUrl.includes('challenge') && !frameUrl.includes('captcha')) continue;
           try {
-            const btn = page.locator(sel).first();
-            if (await btn.isVisible({ timeout: 800 })) {
-              await btn.click();
-              clicked = true;
-              break;
-            }
+            await frame.locator('button, [role="button"], input[type="submit"]').first().click({ timeout: 2000 });
+            clicked = true;
+            break;
           } catch (e) {}
         }
-      }
-
-      // 3. Turnstile iframes
-      if (!clicked) {
-        try {
-          const frames = page.frames();
-          for (const frame of frames) {
-            const frameUrl = frame.url().toLowerCase();
-            if (!frameUrl.includes('turnstile') && !frameUrl.includes('challenge') && !frameUrl.includes('captcha')) continue;
-            try {
-              const clickedInFrame = await frame.evaluate(() => {
-                const els = document.querySelectorAll('button, *[role="button"], input[type="submit"]');
-                for (const el of els) {
-                  if (el.offsetParent !== null) { el.click(); return true; }
-                }
-                return false;
-              });
-              if (clickedInFrame) { clicked = true; break; }
-            } catch (e) {}
-          }
-        } catch (e) {}
-      }
-
-      // 4. Try captcha solver
-      if (!clicked) {
-        await this._trySolveCaptchaOnPage(page);
-      }
-
-      await this._humanDelay(2000, 3000);
+      } catch (e) {}
     }
-    
+
+    if (!clicked) {
+      await this._trySolveCaptchaOnPage(page);
+    }
+
+    await this._humanDelay(2000, 3000);
     return true;
   }
 
   /**
    * Clicks "I'm not a robot" / "Я не робот" checkbox.
-   * IMPORTANT: Must NOT click unrelated checkboxes like "Save login" / "Запомнить".
+   * Only clicks robot-related checkboxes, never "remember me" / "save login".
    */
   async _clickNotRobotCheckbox(page) {
     try {
-      // Only click checkboxes that are inside captcha/challenge containers
-      // or have robot/captcha-related context
       const clicked = await page.evaluate(() => {
-        // Exclusion keywords — DO NOT click these
-        const excludeTexts = [
-          'запомн', 'сохран', 'remember', 'save', 'keep', 'stay',
-          'не выходить', 'оставаться', 'не закрыв',
-        ];
-        
-        // 1. Look for elements specifically about "not a robot"
         const robotTexts = ['not a robot', 'не робот', 'i\'m not a robot', 'я не робот'];
-        const allElements = document.querySelectorAll('label, span, div, p');
-        for (const el of allElements) {
+        const excludeTexts = ['запомн', 'сохран', 'remember', 'save', 'keep', 'stay'];
+
+        const labels = document.querySelectorAll('label, span, div, p');
+        for (const el of labels) {
           const text = (el.textContent || '').toLowerCase().trim();
-          if (text.length > 80 || text.length === 0) continue;
-          if (el.offsetParent === null) continue;
-          
-          // Must contain robot-related text
+          if (text.length > 80 || text.length === 0 || el.offsetParent === null) continue;
           if (!robotTexts.some(rt => text.includes(rt))) continue;
-          // Must NOT contain exclusion text
           if (excludeTexts.some(et => text.includes(et))) continue;
-          
-          // Try to find and click associated checkbox
-          const checkbox = el.querySelector('input[type="checkbox"], [role="checkbox"]')
+
+          const cb = el.querySelector('input[type="checkbox"], [role="checkbox"]')
             || el.closest('label')?.querySelector('input[type="checkbox"]');
-          if (checkbox) {
-            checkbox.click();
-            return true;
-          }
-          // Click the element itself (it might be the checkbox wrapper)
+          if (cb) { cb.click(); return true; }
           el.click();
           return true;
         }
-        
-        // 2. Look for checkboxes inside captcha/challenge containers
-        const captchaContainers = document.querySelectorAll(
-          '[class*="captcha"], [class*="challenge"], [class*="robot"], [id*="captcha"], [id*="challenge"]'
-        );
-        for (const container of captchaContainers) {
+
+        const containers = document.querySelectorAll('[class*="captcha"], [class*="challenge"], [class*="robot"]');
+        for (const container of containers) {
           const cb = container.querySelector('input[type="checkbox"], [role="checkbox"]');
-          if (cb && cb.offsetParent !== null) {
-            cb.click();
-            return true;
-          }
+          if (cb && cb.offsetParent !== null) { cb.click(); return true; }
         }
-        
+
         return false;
       }).catch(() => false);
 
@@ -1345,16 +1217,12 @@ class PlaywrightEngine {
         return true;
       }
 
-      // Try iframes (recaptcha / turnstile)
-      const frames = page.frames();
-      for (const frame of frames) {
+      for (const frame of page.frames()) {
+        const frameUrl = frame.url().toLowerCase();
+        if (!frameUrl.includes('captcha') && !frameUrl.includes('recaptcha') &&
+            !frameUrl.includes('challenge') && !frameUrl.includes('turnstile') &&
+            !frameUrl.includes('hcaptcha') && !frameUrl.includes('anchor')) continue;
         try {
-          const frameUrl = frame.url().toLowerCase();
-          // Only check captcha-related iframes
-          if (!frameUrl.includes('captcha') && !frameUrl.includes('recaptcha') && 
-              !frameUrl.includes('challenge') && !frameUrl.includes('turnstile') &&
-              !frameUrl.includes('hcaptcha') && !frameUrl.includes('anchor')) continue;
-          
           const cb = frame.locator('[role="checkbox"], .rc-anchor-checkbox, .recaptcha-checkbox').first();
           if (await cb.isVisible({ timeout: 1000 })) {
             await cb.click();
@@ -1378,22 +1246,38 @@ class PlaywrightEngine {
       
       // Positive URL checks
       const loggedInUrls = ['/feed', '/im', '/friends', '/groups', '/music', '/video', '/clips', '/market'];
-      if (loggedInUrls.some(u => url.includes(u))) return true;
+      if (loggedInUrls.some(u => url.includes(u))) {
+        // Double check with DOM — VK may redirect to login even with /feed URL
+        try {
+          // Primary: data-testid from codegen recording
+          const profileBtn = page.getByTestId('header-profile-menu-button');
+          if (await profileBtn.isVisible({ timeout: 2000 })) return true;
+        } catch (e) {}
+        
+        // Still trust URL-based check as fallback
+        return true;
+      }
       
       // User profile page (vk.com/id123...)
       if (/vk\.com\/id\d+/.test(url)) return true;
       
-      // Main page when logged in
+      // Main page when logged in — check for logged-in DOM indicators
       if ((url === 'https://vk.com/' || url === 'https://vk.com') && !url.includes('login') && !url.includes('auth')) {
-        // Check for logged-in indicators
+        // Primary: header profile button
+        try {
+          const profileBtn = page.getByTestId('header-profile-menu-button');
+          if (await profileBtn.isVisible({ timeout: 2000 })) return true;
+        } catch (e) {}
+        
+        // Fallback: other logged-in indicators
         const isLoggedIn = await page.evaluate(() => {
           const selectors = [
+            '[data-testid="header-profile-menu-button"]',
             'a[href*="/im"]',
             '[class*="TopNavBtn"]',
             'a[href*="/friends"]',
-            '#l_pr', // left menu profile link
-            '#l_msg', // left menu messages
-            '[data-l="userPage"]',
+            '#l_pr',
+            '#l_msg',
             '.TopNavLink',
             '#top_profile_link',
           ];
@@ -2215,23 +2099,60 @@ class PlaywrightEngine {
     }
     
     try {
+      // Navigate to VK Video (vkvideo.ru is the new VK video domain)
       await page.goto('https://vk.com/video', { waitUntil: 'load', timeout: 20000 });
+      await this._waitForPageReady(page);
       await this._humanDelay(2000, 3000);
 
       if (keywords) {
-        const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[name="q"]').first();
-        if (await searchInput.isVisible({ timeout: 5000 })) {
-          await this._humanType(page, searchInput, keywords);
-          await page.keyboard.press('Enter');
+        // Primary: use data-testid from codegen recording
+        let searchInput = null;
+        try {
+          const testIdInput = page.getByTestId('top-search-video-input');
+          if (await testIdInput.isVisible({ timeout: 3000 })) {
+            searchInput = testIdInput;
+            this.log('[Search] Found search input via data-testid');
+          }
+        } catch (e) {}
+
+        // Fallback: generic search selectors
+        if (!searchInput) {
+          const searchSelectors = [
+            'input[type="search"]',
+            'input[placeholder*="Поиск"]',
+            'input[placeholder*="Search"]',
+            'input[name="q"]',
+          ];
+          for (const sel of searchSelectors) {
+            try {
+              const el = page.locator(sel).first();
+              if (await el.isVisible({ timeout: 2000 })) {
+                searchInput = el;
+                this.log(`[Search] Found search input: ${sel}`);
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+
+        if (searchInput) {
+          await searchInput.click();
+          await this._humanDelay(300, 600);
+          await searchInput.fill(keywords);
+          await this._humanDelay(300, 600);
+          await searchInput.press('Enter');
+          this.log(`[Search] Searched for: "${keywords}"`);
+          
+          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
           await this._humanDelay(3000, 5000);
 
-          // Scroll through results a few times to load more
+          // Scroll through results to load more
           for (let scroll = 0; scroll < 3; scroll++) {
             await page.mouse.wheel(0, this._randomDelay(300, 600));
             await this._humanDelay(1000, 2000);
           }
 
-          // Look for the target video in results by video ID
+          // Look for the target video in results
           if (targetVideoId) {
             const found = await page.evaluate((videoId) => {
               const links = document.querySelectorAll('a[href*="/video"]');
@@ -2257,10 +2178,11 @@ class PlaywrightEngine {
         }
       }
       
-      // Fallback: navigate directly to target URL instead of clicking a random video
+      // Fallback: navigate directly to target URL
       if (targetUrl) {
         this.log(`[Search] Navigating directly to: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'load', timeout: 20000 });
+        await this._waitForPageReady(page);
         await this._humanDelay(2000, 3000);
         return true;
       }
@@ -2268,7 +2190,6 @@ class PlaywrightEngine {
       return false;
     } catch (error) {
       this.log(`[Search] Error: ${error.message}`);
-      // Last resort: navigate directly
       if (targetUrl) {
         try {
           await page.goto(targetUrl, { waitUntil: 'load', timeout: 20000 });
@@ -2289,28 +2210,115 @@ class PlaywrightEngine {
     this.log(`[Watch] Watching for ${watchTime} seconds...`);
     
     try {
-      // Click play if needed
+      // ── Step 1: Ensure video is playing ──
+      // VK Video uses <video> element — try to find and play it
+      let videoPlaying = false;
+
+      // Click the video player area to start playback (VK auto-pauses for bots)
       try {
-        const playBtn = page.locator('.videoplayer_btn_play, [class*="play"], button[aria-label="Play"]').first();
-        if (await playBtn.isVisible({ timeout: 2000 })) {
-          await playBtn.click();
+        // Try clicking the video element directly
+        const videoEl = page.locator('video').first();
+        if (await videoEl.isVisible({ timeout: 3000 })) {
+          await videoEl.click();
           await this._humanDelay(500, 1000);
+          this.log('[Watch] Clicked <video> element');
         }
       } catch (e) {}
 
-      // Simulate watching with random mouse movements
+      // Check if video is actually playing, force play if not
+      try {
+        videoPlaying = await page.evaluate(() => {
+          const videos = document.querySelectorAll('video');
+          for (const video of videos) {
+            if (video.paused || video.ended) {
+              // Force play
+              video.muted = true; // Mute to allow autoplay
+              video.play().catch(() => {});
+            }
+            // Remove any overlays that block playback
+            const overlays = document.querySelectorAll(
+              '[class*="overlay"], [class*="Overlay"], [class*="promo"], [class*="Promo"]'
+            );
+            overlays.forEach(el => {
+              if (el.style) el.style.display = 'none';
+            });
+            return !video.paused;
+          }
+          return false;
+        });
+        if (videoPlaying) {
+          this.log('[Watch] Video is playing');
+        }
+      } catch (e) {}
+
+      // Click play button if video still not playing
+      if (!videoPlaying) {
+        const playSelectors = [
+          'button[class*="play" i]',
+          '[class*="videoplayer"] button',
+          'button[aria-label*="Play"]',
+          'button[aria-label*="Воспроизвести"]',
+          '[class*="PlayerButton"]',
+          '.videoplayer_btn_play',
+        ];
+        for (const sel of playSelectors) {
+          try {
+            const btn = page.locator(sel).first();
+            if (await btn.isVisible({ timeout: 1500 })) {
+              await btn.click();
+              this.log(`[Watch] Clicked play: ${sel}`);
+              await this._humanDelay(500, 1000);
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      // ── Step 2: Final force play attempt ──
+      await page.evaluate(() => {
+        document.querySelectorAll('video').forEach(v => {
+          v.muted = true;
+          v.play().catch(() => {});
+        });
+      }).catch(() => {});
+
+      // ── Step 3: Watch with human-like behavior ──
       const startTime = Date.now();
+      let lastProgressCheck = 0;
+      
       while ((Date.now() - startTime) / 1000 < watchTime) {
         if (page.isClosed()) break;
         
-        // Random mouse movement
-        const x = this._randomDelay(100, 1800);
-        const y = this._randomDelay(100, 900);
+        // Periodic check: is video still playing?
+        const elapsed = (Date.now() - startTime) / 1000;
+        if (elapsed - lastProgressCheck > 15) {
+          lastProgressCheck = elapsed;
+          try {
+            const status = await page.evaluate(() => {
+              const v = document.querySelector('video');
+              if (!v) return { found: false };
+              if (v.paused) { v.muted = true; v.play().catch(() => {}); }
+              return { 
+                found: true, 
+                paused: v.paused, 
+                currentTime: Math.round(v.currentTime),
+                duration: Math.round(v.duration || 0),
+              };
+            });
+            if (status.found) {
+              this.log(`[Watch] Progress: ${status.currentTime}s / ${status.duration}s ${status.paused ? '(PAUSED - restarting)' : ''}`);
+            }
+          } catch (e) {}
+        }
+        
+        // Random mouse movement (keep page "alive")
+        const x = this._randomDelay(200, 1700);
+        const y = this._randomDelay(200, 800);
         await page.mouse.move(x, y);
         
-        // Occasional scroll
-        if (Math.random() < 0.1) {
-          await page.mouse.wheel(0, this._randomDelay(-100, 100));
+        // Occasional small scroll (like a real user)
+        if (Math.random() < 0.08) {
+          await page.mouse.wheel(0, this._randomDelay(-50, 50));
         }
         
         await this._humanDelay(3000, 8000);
