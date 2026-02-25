@@ -2388,9 +2388,11 @@ class PlaywrightEngine {
               const found = await page.evaluate(({ videoId, numId }) => {
                 const links = document.querySelectorAll('a[href]');
                 const videoLinks = [];
+                // Only match actual video page links: /video-NNNN_NNNN (not nav like /trends, /clips)
+                const videoLinkRe = /\/video-?\d+_\d+/;
                 for (const link of links) {
                   const href = link.href || link.getAttribute('href') || '';
-                  if (href.includes('video') || href.includes(numId)) {
+                  if (videoLinkRe.test(href) || href.includes(numId)) {
                     videoLinks.push({ el: link, href });
                   }
                 }
@@ -2441,10 +2443,11 @@ class PlaywrightEngine {
             // Final check with all loaded content
             const finalCheck = await page.evaluate(({ videoId, numId }) => {
               const links = document.querySelectorAll('a[href]');
+              const videoLinkRe = /\/video-?\d+_\d+/;
               let total = 0;
               for (const link of links) {
                 const href = link.href || link.getAttribute('href') || '';
-                if (href.includes('video') || href.includes(numId)) {
+                if (videoLinkRe.test(href) || href.includes(numId)) {
                   total++;
                   if (href.includes(videoId) || href.includes(numId)) {
                     link.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2453,7 +2456,7 @@ class PlaywrightEngine {
                   }
                 }
               }
-              return { found: false, total, sample: [...links].filter(l => (l.href||'').includes('video')).slice(0, 10).map(l => l.href.substring(0, 80)) };
+              return { found: false, total, sample: [...links].filter(l => videoLinkRe.test(l.href||'')).slice(0, 10).map(l => l.href.substring(0, 80)) };
             }, { videoId: targetVideoId, numId: numericId });
             
             if (finalCheck.found) {
@@ -2526,17 +2529,16 @@ class PlaywrightEngine {
     `;
 
     try {
-      // ── Step 0: Get duration from page UI (data-testid="video_duration") ──
-      let pageDuration = null;
+      // ── Step 0: NOTE on duration ──
+      // data-testid="video_duration" in the UI may show the AD countdown (e.g., "00:10")
+      // NOT the actual video duration. We only trust video.duration from JS after playback.
+      // The UI value is logged but NOT used for calculation.
+      let uiDurationText = null;
       try {
         const durSpan = page.getByTestId('video_duration');
-        if (await durSpan.isVisible({ timeout: 3000 })) {
-          const durText = await durSpan.textContent();
-          this.log(`[Watch] Duration from UI: "${durText}"`);
-          const parts = durText.trim().split(':').map(Number);
-          if (parts.length === 2) pageDuration = parts[0] * 60 + parts[1];
-          else if (parts.length === 3) pageDuration = parts[0] * 3600 + parts[1] * 60 + parts[2];
-          if (pageDuration) this.log(`[Watch] Parsed duration: ${pageDuration}s`);
+        if (await durSpan.isVisible({ timeout: 2000 })) {
+          uiDurationText = await durSpan.textContent();
+          this.log(`[Watch] UI duration label: "${uiDurationText}" (may be ad timer, NOT used for calculation)`);
         }
       } catch (e) {}
 
@@ -2595,13 +2597,21 @@ class PlaywrightEngine {
       }).catch(() => []);
 
       if (playResult.length > 0) {
-        this.log(`[Watch] Video state: ${JSON.stringify(playResult)}`);
+        this.log(`[Watch] Found ${playResult.length} video element(s): ${JSON.stringify(playResult)}`);
       }
 
-      const mainVideo = playResult[0];
+      // Pick the video with the longest duration (the real video, not the ad)
+      let mainVideo = playResult[0];
+      if (playResult.length > 1) {
+        const longest = playResult.reduce((best, v) => (v.duration > (best?.duration || 0) ? v : best), null);
+        if (longest && longest.duration > (mainVideo?.duration || 0)) {
+          mainVideo = longest;
+          this.log(`[Watch] Selected longest video: ${mainVideo.duration}s (ad video was ${playResult.find(v => v !== longest)?.duration || '?'}s)`);
+        }
+      }
       if (mainVideo) {
-        const durStr = mainVideo.duration > 0 ? `${mainVideo.duration}s` : (pageDuration ? `${pageDuration}s (UI)` : 'unknown');
-        this.log(`[Watch] Status: paused=${mainVideo.paused}, duration=${durStr}, readyState=${mainVideo.readyState}`);
+        const durStr = mainVideo.duration > 0 ? `${mainVideo.duration}s` : 'unknown';
+        this.log(`[Watch] Main video: paused=${mainVideo.paused}, duration=${durStr}, readyState=${mainVideo.readyState}`);
       }
 
       // ── Step 4: Click play if still paused ──
@@ -2638,7 +2648,7 @@ class PlaywrightEngine {
       // ── Step 6: Watch loop ──
       const startTime = Date.now();
       let lastProgressCheck = 0;
-      let videoDuration = pageDuration ? `${pageDuration}s` : 'unknown';
+      let videoDuration = 'unknown';
       
       while ((Date.now() - startTime) / 1000 < watchTime) {
         if (page.isClosed()) {
@@ -3019,6 +3029,19 @@ class PlaywrightEngine {
 
     const results = { views: 0, likes: 0, comments: 0, errors: 0, ghostViews: 0 };
 
+    // Pre-check: if all proxies are already in error state, don't waste time
+    if (proxyIds.length > 0 && !task.allowDirect) {
+      const proxyList = this.store.get('proxies') || [];
+      const activeProxies = proxyIds.filter(pid => {
+        const p = proxyList.find(pr => pr.id === pid);
+        return p && p.status !== 'error';
+      });
+      if (activeProxies.length === 0) {
+        this.log('[Task] \u274c All selected proxies are in error state. Aborting task. Remove failed proxies and add new ones.');
+        return results;
+      }
+    }
+
     // Combine all ops
     const allOps = [...ops, ...ghostOps];
     const totalOps = allOps.length;
@@ -3101,6 +3124,11 @@ class PlaywrightEngine {
     if (proxyId) {
       const proxy = allProxies.find(p => p.id === proxyId);
       if (proxy) {
+        // Skip proxies already marked as error
+        if (proxy.status === 'error') {
+          this.log(`[\ud83d\udc7b Ghost] \u26a0\ufe0f Proxy ${proxy.host}:${proxy.port} already failed (status=error), skipping`);
+          return { viewed: false, error: true };
+        }
         proxyUrl = this._buildProxyUrl(proxy);
         proxyInfo = `${proxy.type || 'http'}://${proxy.host}:${proxy.port} (${proxy.country || proxy.countryCode || '?'})`;
       }
@@ -3209,6 +3237,11 @@ class PlaywrightEngine {
       if (currentProxyId) {
         const proxy = allProxies.find(p => p.id === currentProxyId);
         if (proxy) {
+          // Skip proxies already marked as error (failed in a previous op)
+          if (proxy.status === 'error') {
+            this.log(`[Op] \u26a0\ufe0f Proxy ${proxy.host}:${proxy.port} already failed (status=error), skipping`);
+            continue;
+          }
           proxyUrl = this._buildProxyUrl(proxy);
           proxyInfo = `${proxy.type || 'http'}://${proxy.host}:${proxy.port} (${proxy.country || proxy.countryCode || '?'}) status=${proxy.status}`;
         } else {
