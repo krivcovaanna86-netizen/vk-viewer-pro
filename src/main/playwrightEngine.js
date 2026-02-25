@@ -190,6 +190,34 @@ class PlaywrightEngine {
     await new Promise(r => setTimeout(r, delay));
   }
 
+  /**
+   * Waits for VK SPA to actually render (not just DOM loaded).
+   * Without this, vk.com loads an empty shell and the bot starts clicking nothing.
+   */
+  async _waitForPageReady(page, timeout = 10000) {
+    try {
+      // Wait for any meaningful VK element to appear
+      await page.waitForSelector(
+        'button, a[href], input, [class*="vkc__"], [class*="TopNav"], #content, #page_body, form',
+        { timeout, state: 'visible' }
+      ).catch(() => {});
+      
+      // Extra wait for JS to hydrate
+      await page.waitForFunction(() => {
+        // Page is ready when there's at least some interactive content
+        const buttons = document.querySelectorAll('button, a, input');
+        const visible = Array.from(buttons).filter(el => el.offsetParent !== null);
+        return visible.length > 2;
+      }, { timeout: timeout }).catch(() => {});
+      
+      // Small extra breathing room
+      await this._humanDelay(500, 1000);
+    } catch (e) {
+      // If waiting fails, just continue — page might be slow
+      this.log(`[Engine] Page ready wait: ${e.message}`);
+    }
+  }
+
   async _humanType(page, selector, text) {
     const settings = this.store.get('settings') || {};
     const { min: typeMin, max: typeMax } = settings.typingDelay || { min: 50, max: 150 };
@@ -253,8 +281,10 @@ class PlaywrightEngine {
     try {
       // ── Step 1: Navigate to vk.com ──
       this.log('[VK Login] Step 1: Navigating to vk.com...');
-      await page.goto('https://vk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await this._humanDelay(3000, 5000);
+      await page.goto('https://vk.com/', { waitUntil: 'load', timeout: 30000 });
+      // Wait for VK SPA to render — without this the page "drifts" and bot clicks on nothing
+      await this._waitForPageReady(page);
+      await this._humanDelay(2000, 3000);
 
       // ── Step 1a: Handle robot challenge on initial load ──
       await this._handleRobotChallenge(page);
@@ -320,7 +350,8 @@ class PlaywrightEngine {
       // If still not found, go directly to id.vk.com
       if (!foundAltLogin) {
         this.log('[VK Login] Alt login not found, navigating to id.vk.com/auth...');
-        await page.goto('https://id.vk.com/auth', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto('https://id.vk.com/auth', { waitUntil: 'load', timeout: 30000 });
+        await this._waitForPageReady(page);
         await this._humanDelay(2000, 3000);
       }
 
@@ -781,6 +812,10 @@ class PlaywrightEngine {
         await this._humanDelay(1500, 2500);
       }
 
+      // ── Step 10a: Handle VK registration/confirmation popups ──
+      // "Вы создаёте аккаунт ВКонтакте" / "Подтвердите" / extra confirmation screens
+      await this._handlePostLoginPopups(page);
+
       // Try solve captcha if present (Python ref: max_captcha_attempts loop)
       const settings = this.store.get('settings') || {};
       const maxCaptchaAttempts = settings.maxCaptchaAttempts || 3;
@@ -849,7 +884,7 @@ class PlaywrightEngine {
 
       // Navigate to feed to double-check (Python ref: "feed" in current_url)
       try {
-        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
         await this._humanDelay(2000, 3000);
         
         if (await this._checkVKLogin(page)) {
@@ -1044,6 +1079,110 @@ class PlaywrightEngine {
       }
     } catch (e) {}
     return false;
+  }
+
+  /**
+   * Handles post-login popups that VK may show:
+   * - "Вы создаёте аккаунт ВКонтакте" (You're creating a VK account)
+   * - "Подтвердите действие" (Confirm action)
+   * - "Добро пожаловать" (Welcome)
+   * - Cookie consent, notification permissions, etc.
+   * 
+   * Strategy: detect popup text, click appropriate button (usually "Продолжить"/"Continue"
+   * or "Нет"/"У меня уже есть аккаунт" for registration prompts).
+   * Runs up to 3 passes to handle chained popups.
+   */
+  async _handlePostLoginPopups(page) {
+    for (let pass = 0; pass < 3; pass++) {
+      const popupAction = await page.evaluate(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        const url = (window.location.href || '').toLowerCase();
+
+        // Registration prompt: "Вы создаёте аккаунт" — we do NOT want to register
+        const isRegistration = body.includes('создаёте аккаунт') || body.includes('создаете аккаунт') ||
+                               body.includes('creating an account') || body.includes('регистрац') ||
+                               body.includes('create a new') || body.includes('новый аккаунт') ||
+                               url.includes('join') || url.includes('register') || url.includes('signup');
+        
+        if (isRegistration) {
+          // Try to find "Нет" / "У меня уже есть аккаунт" / "Назад" / "Back" buttons
+          const cancelTexts = [
+            'у меня уже есть', 'уже есть аккаунт', 'уже зарегистрирован',
+            'i already have', 'already registered',
+            'назад', 'back', 'нет', 'отмена', 'cancel', 'вернуться',
+          ];
+          const btns = document.querySelectorAll('button, a, span, [role="button"]');
+          for (const btn of btns) {
+            const txt = (btn.textContent || '').toLowerCase().trim();
+            if (txt.length > 60 || txt.length === 0) continue;
+            if (btn.offsetParent === null || btn.disabled) continue;
+            if (cancelTexts.some(ct => txt.includes(ct))) {
+              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              btn.click();
+              return 'cancel_registration';
+            }
+          }
+          // If no cancel button — sometimes "Продолжить" is the only way forward
+          for (const btn of btns) {
+            const txt = (btn.textContent || '').toLowerCase().trim();
+            if (txt.length > 30) continue;
+            if (btn.offsetParent === null || btn.disabled) continue;
+            if (txt.includes('продолжить') || txt.includes('continue')) {
+              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              btn.click();
+              return 'continue_registration';
+            }
+          }
+          return 'registration_no_button';
+        }
+
+        // Generic confirmation / welcome / info popup — just click through
+        const isConfirmation = body.includes('подтвердите') || body.includes('confirm') ||
+                               body.includes('добро пожаловать') || body.includes('welcome') ||
+                               body.includes('разрешить') || body.includes('allow');
+
+        if (isConfirmation) {
+          const confirmTexts = [
+            'продолжить', 'continue', 'подтвердить', 'confirm',
+            'ок', 'ok', 'готово', 'done', 'далее', 'next',
+            'принять', 'accept', 'разрешить', 'allow',
+          ];
+          const btns = document.querySelectorAll('button, a, [role="button"]');
+          for (const btn of btns) {
+            const txt = (btn.textContent || '').toLowerCase().trim();
+            if (txt.length > 30) continue;
+            if (btn.offsetParent === null || btn.disabled) continue;
+            if (confirmTexts.some(ct => txt.includes(ct))) {
+              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              btn.click();
+              return 'confirmed';
+            }
+          }
+          return 'confirmation_no_button';
+        }
+
+        // Cookie consent
+        const isCookieConsent = body.includes('cookie') && (body.includes('принять') || body.includes('accept'));
+        if (isCookieConsent) {
+          const btns = document.querySelectorAll('button, a, [role="button"]');
+          for (const btn of btns) {
+            const txt = (btn.textContent || '').toLowerCase().trim();
+            if ((txt.includes('принять') || txt.includes('accept') || txt.includes('ок') || txt.includes('ok')) && btn.offsetParent !== null) {
+              btn.click();
+              return 'cookie_accepted';
+            }
+          }
+        }
+
+        return null; // No popup detected
+      }).catch(() => null);
+
+      if (!popupAction) break; // No popups left
+
+      this.log(`[VK Login] Post-login popup handled: ${popupAction}`);
+      await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+      await this._humanDelay(1500, 2500);
+    }
   }
 
   /**
@@ -1795,8 +1934,9 @@ class PlaywrightEngine {
           triedSession = true;
 
           const page = await context.newPage();
-          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await this._humanDelay(2000, 4000);
+          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 30000 });
+          await this._waitForPageReady(page);
+          await this._humanDelay(1000, 2000);
           isLoggedIn = await this._checkVKLogin(page);
           
           if (isLoggedIn) {
@@ -1823,8 +1963,9 @@ class PlaywrightEngine {
           }
 
           const page = await context.newPage();
-          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await this._humanDelay(2000, 4000);
+          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 30000 });
+          await this._waitForPageReady(page);
+          await this._humanDelay(1000, 2000);
           isLoggedIn = await this._checkVKLogin(page);
           
           if (!isLoggedIn) {
@@ -1889,7 +2030,7 @@ class PlaywrightEngine {
         }
         
         const page = await context.newPage();
-        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 30000 });
         await this._humanDelay(2000, 4000);
         isLoggedIn = await this._checkVKLogin(page);
       }
@@ -1967,7 +2108,7 @@ class PlaywrightEngine {
         case 'chill': {
           // Just browse the feed
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
           const scrollCount = this._randomDelay(warmUp.homePageMin || 3, warmUp.homePageMax || 8);
           for (let i = 0; i < scrollCount; i++) {
             if (!pageAlive()) return;
@@ -1983,7 +2124,7 @@ class PlaywrightEngine {
         case 'curious': {
           // Browse feed, click on a video/post
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
           await this._humanDelay(2000, 4000);
           // Scroll a bit
           for (let i = 0; i < 3; i++) {
@@ -2010,7 +2151,7 @@ class PlaywrightEngine {
           const destinations = ['https://vk.com/video', 'https://vk.com/clips', 'https://vk.com/discover'];
           const dest = destinations[Math.floor(Math.random() * destinations.length)];
           if (!pageAlive()) return;
-          await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await page.goto(dest, { waitUntil: 'load', timeout: 15000 });
           await this._humanDelay(2000, 4000);
           const scrolls = this._randomDelay(2, 5);
           for (let i = 0; i < scrolls; i++) {
@@ -2026,7 +2167,7 @@ class PlaywrightEngine {
           const queries = ['музыка 2025', 'смешные видео', 'новости', 'рецепты', 'фильмы', 'мемы'];
           const query = queries[Math.floor(Math.random() * queries.length)];
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await page.goto('https://vk.com/video', { waitUntil: 'load', timeout: 15000 });
           await this._humanDelay(1000, 2000);
           try {
             const searchInput = page.locator('input[type="search"], input[placeholder*="Поиск"], input[name="q"]').first();
@@ -2047,7 +2188,7 @@ class PlaywrightEngine {
         case 'impatient': {
           // Quick browse, leave fast
           if (!pageAlive()) return;
-          await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 15000 });
           await this._humanDelay(1000, 3000);
           await page.mouse.wheel(0, 300);
           await this._humanDelay(500, 1500);
@@ -2074,7 +2215,7 @@ class PlaywrightEngine {
     }
     
     try {
-      await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await page.goto('https://vk.com/video', { waitUntil: 'load', timeout: 20000 });
       await this._humanDelay(2000, 3000);
 
       if (keywords) {
@@ -2119,7 +2260,7 @@ class PlaywrightEngine {
       // Fallback: navigate directly to target URL instead of clicking a random video
       if (targetUrl) {
         this.log(`[Search] Navigating directly to: ${targetUrl}`);
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(targetUrl, { waitUntil: 'load', timeout: 20000 });
         await this._humanDelay(2000, 3000);
         return true;
       }
@@ -2130,7 +2271,7 @@ class PlaywrightEngine {
       // Last resort: navigate directly
       if (targetUrl) {
         try {
-          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await page.goto(targetUrl, { waitUntil: 'load', timeout: 20000 });
           await this._humanDelay(2000, 3000);
           return true;
         } catch (e) {}
@@ -2425,8 +2566,9 @@ class PlaywrightEngine {
           } catch (e) {}
         }
           
-        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await this._humanDelay(2000, 3000);
+        await page.goto('https://vk.com/feed', { waitUntil: 'load', timeout: 20000 });
+        await this._waitForPageReady(page);
+        await this._humanDelay(1000, 2000);
         loggedIn = await this._checkVKLogin(page);
         
         if (loggedIn) {
@@ -2466,11 +2608,11 @@ class PlaywrightEngine {
         // If search did not navigate to any video, go directly
         if (!found && videoUrl) {
           this.log('[Op] Search failed, navigating directly to video URL...');
-          await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await page.goto(videoUrl, { waitUntil: 'load', timeout: 20000 });
           await this._humanDelay(2000, 3000);
         }
       } else {
-        await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(videoUrl, { waitUntil: 'load', timeout: 20000 });
         await this._humanDelay(2000, 3000);
       }
 
