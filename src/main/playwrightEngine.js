@@ -13,6 +13,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const { app } = require('electron');
 const { chromium } = require('playwright-core');
 
@@ -324,51 +325,44 @@ class PlaywrightEngine {
       await page.waitForTimeout(this.randomInt(2000, 4000));
 
       // ── Step 1a: Handle robot challenge "Проверяем, что вы не робот" ──
-      const robotChallenge = await this._handleRobotChallenge(page);
-      if (robotChallenge === 'blocked') {
-        return { success: false, error: 'robot_challenge', details: 'VK robot verification required, try with proxy or later' };
+      const robotResult = await this._handleRobotChallenge(page);
+      if (robotResult === 'blocked') {
+        return { success: false, error: 'robot_challenge', details: 'VK robot verification failed — try with proxy or later' };
       }
 
-      // ── Step 2: Click "Войти другим способом" to switch from QR to phone/email form ──
+      // ── Step 2: Click "Войти другим способом" — switch from QR to phone/email ──
       const altLoginBtn = page.locator('button:has-text("Войти другим способом")').first();
       if (await altLoginBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
         await altLoginBtn.click();
         this._log('info', 'Clicked "Войти другим способом"');
         await page.waitForTimeout(this.randomInt(2000, 4000));
       } else {
-        this._log('warn', '"Войти другим способом" button not found, trying direct login page...');
-        // Fallback: try going to id.vk.com directly
+        this._log('warn', '"Войти другим способом" not found — trying direct navigation');
         await page.goto('https://id.vk.com/auth', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(this.randomInt(2000, 4000));
       }
 
-      // ── Step 3: Determine login type (phone vs email) and select radio ──
+      // ── Step 3: Select phone / email radio ──
       const isPhone = this._isPhoneNumber(login);
       this._log('info', `Login type: ${isPhone ? 'phone' : 'email/login'}`);
 
       if (isPhone) {
-        // Make sure "Телефон" radio is selected (it's default, but be safe)
         const phoneRadio = page.locator('input[name="login-view"][value="phone"]');
         if (await phoneRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
-          const isChecked = await phoneRadio.isChecked().catch(() => true);
-          if (!isChecked) {
-            await phoneRadio.click();
-            await page.waitForTimeout(this.randomInt(500, 1000));
-          }
+          const checked = await phoneRadio.isChecked().catch(() => true);
+          if (!checked) { await phoneRadio.click(); await page.waitForTimeout(500); }
         }
       } else {
-        // Select "Почта" radio for email/login input
+        // Click "Почта" radio — try the radio itself, then the label
         const emailRadio = page.locator('input[name="login-view"][value="email"]');
         if (await emailRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
           await emailRadio.click();
-          await page.waitForTimeout(this.randomInt(500, 1000));
+          await page.waitForTimeout(500);
           this._log('info', 'Switched to email/login mode');
         } else {
-          // Try clicking the label
-          const emailLabel = page.locator('label:has-text("Почта")').first();
-          if (await emailLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
-            await emailLabel.click();
-            await page.waitForTimeout(this.randomInt(500, 1000));
+          const lbl = page.locator('label:has-text("Почта")').first();
+          if (await lbl.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await lbl.click(); await page.waitForTimeout(500);
           }
         }
       }
@@ -377,157 +371,141 @@ class PlaywrightEngine {
       const loginInput = page.locator('input[name="login"]').first();
       await loginInput.waitFor({ state: 'visible', timeout: 10000 });
       await loginInput.click();
-      await page.waitForTimeout(this.randomInt(300, 700));
+      await page.waitForTimeout(this.randomInt(300, 600));
 
       if (isPhone) {
-        // Phone input has "+7 " pre-filled. Clear it and type just the 10 digits.
-        // VK auto-formats to "+7 XXX XXX XX XX"
-        const phoneDigits = this._normalizePhone(login);
-        // Triple-click to select all, then delete
+        // Field pre-filled with "+7 ". Clear all, type 10 digits.
+        const digits = this._normalizePhone(login);
         await loginInput.click({ clickCount: 3 });
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(150);
         await page.keyboard.press('Backspace');
-        await page.waitForTimeout(200);
-        // Now type the digits — VK will auto-add "+7 " prefix
-        await this.typeHumanLike(loginInput, phoneDigits);
+        await page.waitForTimeout(150);
+        await this.typeHumanLike(loginInput, digits);
       } else {
-        // For email/login: clear and type
         await loginInput.fill('');
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(150);
         await this.typeHumanLike(loginInput, login);
       }
-      await page.waitForTimeout(this.randomInt(500, 1500));
+      await page.waitForTimeout(this.randomInt(500, 1200));
 
-      // ── Step 5: Click "Войти" to submit phone/email ──
-      const submitLoginBtn = page.locator('button:has-text("Войти")').first();
-      if (await submitLoginBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await submitLoginBtn.click();
-        this._log('info', 'Clicked "Войти" — waiting for next step...');
+      // ── Step 5: Submit phone/email → "Войти" ──
+      const submitBtn = page.locator('button:has-text("Войти")').first();
+      if (await submitBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await submitBtn.click();
+        this._log('info', 'Clicked "Войти"');
       } else {
-        // Fallback: press Enter
         await page.keyboard.press('Enter');
-        this._log('info', 'Pressed Enter to submit login');
       }
       await page.waitForTimeout(this.randomInt(4000, 7000));
 
-      // ── Step 6: Check what happened — OTP page, password page, error, or captcha ──
-      const currentUrl = page.url();
-      this._log('info', `After login submit: ${currentUrl.substring(0, 80)}...`);
+      // ── Step 6: Detect page state ──
+      const curUrl = page.url();
+      this._log('info', `After submit: ${curUrl.substring(0, 90)}...`);
 
-      // Check for captcha
-      const hasCaptcha = await page.evaluate(() => {
-        const bodyText = document.body.innerText || '';
-        return bodyText.includes('captcha') || bodyText.includes('каптча') ||
-               !!document.querySelector('[class*="captcha"], [class*="Captcha"], img[src*="captcha"]');
-      });
-      if (hasCaptcha) {
-        this._log('warn', 'CAPTCHA detected during VK login');
-        return { success: false, error: 'captcha', details: 'Captcha appeared during login' };
+      // 6-err: check captcha on this page
+      const captchaSolved = await this._trySolveCaptchaOnPage(page);
+      // (if captcha was present and solved, flow continues; if failed — returns below)
+
+      // 6-err: check error message
+      const loginErr = await this._getVisibleError(page);
+      if (loginErr) {
+        this._log('error', `Login error: ${loginErr}`);
+        return { success: false, error: 'login_error', details: loginErr };
       }
 
-      // Check for error messages (e.g. "Пользователь не найден")
-      const loginError = await page.evaluate(() => {
-        const errorEls = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"]');
-        for (const el of errorEls) {
-          if (el.offsetWidth > 0 && el.textContent.trim()) return el.textContent.trim();
-        }
-        return null;
-      });
-      if (loginError) {
-        this._log('error', `VK login error: ${loginError}`);
-        return { success: false, error: 'login_error', details: loginError };
-      }
-
-      // ── Step 6a: Handle OTP (SMS code) page ──
-      // VK now shows OTP by default. We need to click "Подтвердить другим способом" to get password field.
-      const otpInput = page.locator('input[name="otp-cell"]').first();
-      const hasOtp = await otpInput.isVisible({ timeout: 3000 }).catch(() => false);
+      // ── Step 6a: OTP page → click "Подтвердить другим способом" ──
+      const hasOtp = await page.locator('input[name="otp-cell"]').first()
+        .isVisible({ timeout: 3000 }).catch(() => false);
 
       if (hasOtp) {
-        this._log('info', 'OTP page detected — clicking "Подтвердить другим способом" for password...');
-        const altConfirmBtn = page.locator('button:has-text("Подтвердить другим способом")').first();
-        if (await altConfirmBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-          await altConfirmBtn.click();
+        this._log('info', 'OTP page — clicking "Подтвердить другим способом"...');
+        const altConfirm = page.locator('button:has-text("Подтвердить другим способом")').first();
+        if (await altConfirm.isVisible({ timeout: 5000 }).catch(() => false)) {
+          await altConfirm.click();
           await page.waitForTimeout(this.randomInt(2000, 4000));
         } else {
-          this._log('warn', 'Cannot find "Подтвердить другим способом" — only SMS/OTP available');
-          return { success: false, error: 'otp_only', details: 'Account requires SMS code, password option not available' };
+          this._log('warn', '"Подтвердить другим способом" not found — OTP-only account');
+          return { success: false, error: 'otp_only', details: 'Account requires SMS code, no password option' };
         }
       }
 
-      // ── Step 6b: Handle "Выберите способ подтверждения" popup ──
-      // This popup offers: QR-код, Код на телефон, Восстановить доступ, and may also show password
+      // ── Step 6b: CRITICAL — dismiss "Выберите способ подтверждения" popup FIRST ──
+      // After "Подтвердить другим способом" VK shows BOTH the password form
+      // AND an overlay popup simultaneously. The popup blocks the password field.
+      // Must close it before we can interact with the password input.
       await this._dismissConfirmationPopup(page);
 
       // ── Step 7: Enter password ──
       const passInput = page.locator('input[name="password"], input[type="password"]').first();
-      const hasPassword = await passInput.isVisible({ timeout: 8000 }).catch(() => false);
+      const hasPass = await passInput.isVisible({ timeout: 8000 }).catch(() => false);
 
-      if (hasPassword) {
-        this._log('info', 'Password field found — entering password...');
-        await passInput.click();
-        await page.waitForTimeout(this.randomInt(300, 700));
-        await this.typeHumanLike(passInput, password);
-        await page.waitForTimeout(this.randomInt(500, 1500));
-
-        // Click "Продолжить" (Continue)
-        const continueBtn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button[type="submit"]').first();
-        if (await continueBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-          await continueBtn.click();
-          this._log('info', 'Clicked "Продолжить" — waiting for result...');
-        } else {
-          await page.keyboard.press('Enter');
-        }
-        await page.waitForTimeout(this.randomInt(5000, 8000));
-      } else {
-        this._log('warn', 'No password field found');
-        // Maybe we're already on a 2FA challenge or some other state
-        const pageText = await page.evaluate(() => document.body.innerText.substring(0, 300));
-        return { success: false, error: 'no_password_field', details: `Page state: ${pageText.substring(0, 150)}` };
+      if (!hasPass) {
+        const snap = await page.evaluate(() => document.body.innerText.substring(0, 300));
+        this._log('warn', `No password field. Page: ${snap.substring(0, 120)}`);
+        return { success: false, error: 'no_password_field', details: snap.substring(0, 150) };
       }
 
-      // ── Step 8: After password — check for 2FA, additional challenges, or success ──
+      this._log('info', 'Password field visible — entering password...');
+      await passInput.click();
+      await page.waitForTimeout(this.randomInt(300, 600));
+      await this.typeHumanLike(passInput, password);
+      await page.waitForTimeout(this.randomInt(500, 1200));
 
-      // Check for "Выберите способ подтверждения" again (may appear after password)
+      // "Продолжить" starts DISABLED; it enables after password is typed.
+      // Wait for it to become enabled (no .vkuiButton__disabled class).
+      const contBtn = page.locator(
+        'button:has-text("Продолжить"):not(.vkuiButton__disabled)'
+      ).first();
+      const contEnabled = await contBtn.isVisible({ timeout: 5000 }).catch(() => false);
+
+      if (contEnabled) {
+        await contBtn.click();
+        this._log('info', 'Clicked "Продолжить"');
+      } else {
+        // Fallback — try any Продолжить or Enter
+        const anyBtn = page.locator('button:has-text("Продолжить")').first();
+        if (await anyBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await anyBtn.click();
+          this._log('info', 'Clicked "Продолжить" (may still be disabled)');
+        } else {
+          await page.keyboard.press('Enter');
+          this._log('info', 'Pressed Enter to submit password');
+        }
+      }
+      await page.waitForTimeout(this.randomInt(5000, 8000));
+
+      // ── Step 8: Post-password checks ──
       await this._dismissConfirmationPopup(page);
 
-      // Check for 2FA code input
+      // 8a: captcha after password?
+      await this._trySolveCaptchaOnPage(page);
+
+      // 8b: 2FA?
       const has2fa = await page.locator('input[name="otp-cell"], input[name="code"]').first()
         .isVisible({ timeout: 3000 }).catch(() => false);
       if (has2fa) {
         this._log('warn', '2FA code requested after password');
-        return { success: false, error: 'challenge', details: '2FA verification code required after password' };
+        return { success: false, error: 'challenge', details: '2FA code required' };
       }
 
-      // Check for another captcha after password
-      const hasCaptcha2 = await page.evaluate(() => {
-        return !!document.querySelector('[class*="captcha"], [class*="Captcha"], img[src*="captcha"]');
-      });
-      if (hasCaptcha2) {
-        this._log('warn', 'CAPTCHA detected after password');
-        return { success: false, error: 'captcha', details: 'Captcha appeared after password entry' };
-      }
-
-      // Check for error after password
-      const passError = await page.evaluate(() => {
-        const errorEls = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"]');
-        for (const el of errorEls) {
-          const text = el.textContent.trim();
-          if (el.offsetWidth > 0 && text && text.length > 3) return text;
-        }
-        // Also check for "Неверный пароль"
-        const bodyText = document.body.innerText || '';
-        if (bodyText.includes('Неверный пароль') || bodyText.includes('Incorrect password')) {
+      // 8c: wrong password?
+      const passErr = await page.evaluate(() => {
+        const body = document.body.innerText || '';
+        if (body.includes('Неверный пароль') || body.includes('Incorrect password'))
           return 'Неверный пароль';
+        const els = document.querySelectorAll('[class*="error" i], [role="alert"]');
+        for (const el of els) {
+          const t = el.textContent.trim();
+          if (el.offsetWidth > 0 && t.length > 3) return t;
         }
         return null;
       });
-      if (passError) {
-        this._log('error', `Password error: ${passError}`);
-        return { success: false, error: 'wrong_password', details: passError };
+      if (passErr) {
+        this._log('error', `Password error: ${passErr}`);
+        return { success: false, error: 'wrong_password', details: passErr };
       }
 
-      // ── Step 9: Check if we're logged in ──
+      // ── Step 9: Check login success ──
       const isLoggedIn = await this._checkVKLogin(page);
       if (isLoggedIn) {
         this._log('success', `VK login successful: ${login}`);
@@ -535,25 +513,24 @@ class PlaywrightEngine {
         return { success: true, cookies };
       }
 
-      // Final unknown state
-      const finalUrl = page.url();
-      const finalText = await page.evaluate(() => document.body.innerText.substring(0, 200));
-      this._log('error', `VK login failed — unknown state at: ${finalUrl.substring(0, 80)}`);
-      return { success: false, error: 'unknown', details: `URL: ${finalUrl.substring(0, 100)}, Text: ${finalText.substring(0, 100)}` };
+      const fUrl = page.url();
+      const fText = await page.evaluate(() => document.body.innerText.substring(0, 250));
+      this._log('error', `Login ended in unknown state: ${fUrl.substring(0, 80)}`);
+      return { success: false, error: 'unknown', details: `URL: ${fUrl.substring(0, 100)} | ${fText.substring(0, 100)}` };
     } catch (e) {
-      this._log('error', `VK login error: ${e.message}`);
+      this._log('error', `VK login exception: ${e.message}`);
       return { success: false, error: 'exception', details: e.message };
     }
   }
 
+  // ──────── Popups & Challenges ────────
+
   /**
-   * Dismiss the "Выберите способ подтверждения" popup that may appear.
-   * This popup offers QR-код, Код на телефон, etc.
-   * We try to close it so the password form remains accessible.
+   * Dismiss "Выберите способ подтверждения" overlay.
+   * It appears on top of the password form and blocks interaction.
    */
   async _dismissConfirmationPopup(page) {
     try {
-      // Look for the popup with "Выберите способ подтверждения" or "Закрыть"
       const closeBtn = page.locator('button:has-text("Закрыть")').first();
       if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
         await closeBtn.click();
@@ -566,53 +543,328 @@ class PlaywrightEngine {
   }
 
   /**
-   * Handle VK "Проверяем, что вы не робот" (robot challenge) page.
-   * This page appears when VK suspects automated access.
-   * It typically has a "Продолжить" button that when clicked may solve the challenge
-   * or redirect to a CAPTCHA.
-   * Returns: 'passed' if challenge handled, 'blocked' if cannot proceed, 'none' if no challenge.
+   * Handle "Проверяем, что вы не робот" challenge.
+   * Tries "Продолжить", then attempts ruCaptcha if captcha appears.
+   * Returns: 'passed' | 'blocked' | 'none'
    */
   async _handleRobotChallenge(page) {
     try {
       const url = page.url();
       const isChallenge = url.includes('challenge.html') || url.includes('/challenge');
       if (!isChallenge) {
-        // Also check by page text
-        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300));
-        if (!bodyText.includes('не робот') && !bodyText.includes('not a robot')) return 'none';
+        const body = await page.evaluate(() => document.body.innerText.substring(0, 300));
+        if (!body.includes('не робот') && !body.includes('not a robot')) return 'none';
       }
 
-      this._log('warn', 'VK robot challenge detected — attempting to pass...');
+      this._log('warn', 'VK robot challenge detected');
 
-      // Try clicking "Продолжить" (Continue) button on the challenge page
-      const continueBtn = page.locator('button:has-text("Продолжить")').first();
-      if (await continueBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await continueBtn.click();
+      // Click "Продолжить"
+      const btn = page.locator('button:has-text("Продолжить")').first();
+      if (await btn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await btn.click();
         await page.waitForTimeout(this.randomInt(5000, 8000));
-
-        // Check if we got through
-        const newUrl = page.url();
-        if (!newUrl.includes('challenge')) {
+        if (!page.url().includes('challenge')) {
           this._log('success', 'Robot challenge passed');
           return 'passed';
         }
       }
 
-      // If still on challenge page, check for CAPTCHA
-      const hasCaptcha = await page.evaluate(() => {
-        return !!document.querySelector('iframe[src*="captcha"], [class*="captcha"], [class*="Captcha"]');
-      });
-      if (hasCaptcha) {
-        this._log('warn', 'Robot challenge requires CAPTCHA');
-        return 'blocked';
+      // Try solving captcha on the challenge page
+      const solved = await this._trySolveCaptchaOnPage(page);
+      if (solved) {
+        await page.waitForTimeout(3000);
+        if (!page.url().includes('challenge')) {
+          this._log('success', 'Robot challenge solved via captcha');
+          return 'passed';
+        }
       }
 
       this._log('warn', 'Robot challenge could not be resolved');
       return 'blocked';
     } catch (e) {
-      this._log('warn', `Robot challenge handler error: ${e.message}`);
+      this._log('warn', `Robot challenge error: ${e.message}`);
       return 'none';
     }
+  }
+
+  /** Return visible error text from the page, or null. */
+  async _getVisibleError(page) {
+    return page.evaluate(() => {
+      const els = document.querySelectorAll('[class*="error" i], [class*="Error"], [role="alert"]');
+      for (const el of els) {
+        if (el.offsetWidth > 0 && el.textContent.trim().length > 3) return el.textContent.trim();
+      }
+      return null;
+    }).catch(() => null);
+  }
+
+  // ──────── ruCaptcha / 2Captcha Integration ────────
+
+  /**
+   * Look for any captcha on the current page and try to solve it via ruCaptcha.
+   * Supports:
+   *  - Image captcha (img[src*="captcha"])
+   *  - VK-specific captcha iframes
+   * Returns true if captcha was found and solved, false otherwise.
+   */
+  async _trySolveCaptchaOnPage(page) {
+    const settings = this.store.get('settings');
+    const apiKey = settings.ruCaptchaKey;
+    if (!apiKey) return false; // no key configured
+
+    try {
+      // Detect captcha image (classic VK captcha)
+      const captchaInfo = await page.evaluate(() => {
+        // Classic VK image captcha
+        const img = document.querySelector('img[src*="captcha"], img.captcha_img, #captcha_img');
+        if (img && img.src) {
+          const input = document.querySelector('input[name="captcha_key"], input[name="captcha_answer"], input#captcha_input');
+          return { type: 'image', src: img.src, hasInput: !!input };
+        }
+        // Check for generic captcha container
+        const container = document.querySelector('[class*="captcha" i], [class*="Captcha"]');
+        if (container) {
+          const innerImg = container.querySelector('img');
+          if (innerImg && innerImg.src) {
+            return { type: 'image', src: innerImg.src, hasInput: true };
+          }
+          return { type: 'unknown_captcha', hasInput: false };
+        }
+        return null;
+      });
+
+      if (!captchaInfo) return false;
+
+      this._log('info', `Captcha detected: ${captchaInfo.type}`);
+
+      if (captchaInfo.type === 'image' && captchaInfo.src) {
+        return await this._solveImageCaptcha(page, captchaInfo.src, apiKey);
+      }
+
+      // For unknown captcha types — try screenshot-based solving
+      if (captchaInfo.type === 'unknown_captcha') {
+        return await this._solveScreenshotCaptcha(page, apiKey);
+      }
+
+      return false;
+    } catch (e) {
+      this._log('warn', `Captcha detection error: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Solve an image captcha via ruCaptcha (2Captcha-compatible API).
+   * Downloads the image, sends to ruCaptcha, waits for answer, enters it.
+   */
+  async _solveImageCaptcha(page, imageUrl, apiKey) {
+    try {
+      this._log('info', 'Solving image captcha via ruCaptcha...');
+
+      // Download image as base64
+      const base64 = await this._downloadImageAsBase64(imageUrl);
+      if (!base64) {
+        this._log('warn', 'Failed to download captcha image');
+        return false;
+      }
+
+      // Submit to ruCaptcha
+      const taskId = await this._ruCaptchaSubmit(apiKey, {
+        method: 'base64',
+        body: base64,
+      });
+      if (!taskId) return false;
+
+      // Poll for result
+      const answer = await this._ruCaptchaPoll(apiKey, taskId);
+      if (!answer) return false;
+
+      this._log('info', `Captcha answer: ${answer}`);
+
+      // Enter answer into input
+      const captchaInput = page.locator(
+        'input[name="captcha_key"], input[name="captcha_answer"], input#captcha_input, ' +
+        'input[placeholder*="код"], input[placeholder*="captcha" i]'
+      ).first();
+
+      if (await captchaInput.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await captchaInput.fill('');
+        await captchaInput.type(answer, { delay: this.randomInt(40, 100) });
+        await page.waitForTimeout(500);
+
+        // Submit
+        const submitBtn = page.locator(
+          'button[type="submit"], button:has-text("Отправить"), button:has-text("Продолжить"), button:has-text("OK")'
+        ).first();
+        if (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await submitBtn.click();
+        } else {
+          await page.keyboard.press('Enter');
+        }
+        await page.waitForTimeout(this.randomInt(3000, 5000));
+        this._log('success', 'Captcha answer submitted');
+        return true;
+      }
+
+      this._log('warn', 'Captcha input field not found');
+      return false;
+    } catch (e) {
+      this._log('error', `Image captcha solve error: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Take a screenshot of the captcha region and solve via ruCaptcha.
+   */
+  async _solveScreenshotCaptcha(page, apiKey) {
+    try {
+      this._log('info', 'Attempting screenshot-based captcha solve...');
+      const screenshot = await page.screenshot({ type: 'png' });
+      const base64 = screenshot.toString('base64');
+
+      const taskId = await this._ruCaptchaSubmit(apiKey, {
+        method: 'base64',
+        body: base64,
+        instructions: 'Solve the captcha shown in the image',
+      });
+      if (!taskId) return false;
+
+      const answer = await this._ruCaptchaPoll(apiKey, taskId);
+      if (!answer) return false;
+
+      this._log('info', `Screenshot captcha answer: ${answer}`);
+
+      // Try to find any input to enter the answer
+      const input = page.locator('input[type="text"]:visible').first();
+      if (await input.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await input.fill('');
+        await input.type(answer, { delay: this.randomInt(40, 100) });
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(3000);
+        this._log('success', 'Screenshot captcha submitted');
+        return true;
+      }
+      return false;
+    } catch (e) {
+      this._log('warn', `Screenshot captcha error: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Submit a captcha task to ruCaptcha / 2Captcha.
+   * Returns taskId or null.
+   */
+  async _ruCaptchaSubmit(apiKey, params) {
+    const host = 'rucaptcha.com'; // also works with 2captcha.com
+    try {
+      const formData = new URLSearchParams();
+      formData.set('key', apiKey);
+      formData.set('json', '1');
+      formData.set('method', params.method || 'base64');
+      if (params.body) formData.set('body', params.body);
+      if (params.instructions) formData.set('textinstructions', params.instructions);
+
+      const response = await this._httpPost(`https://${host}/in.php`, formData.toString());
+      const data = JSON.parse(response);
+
+      if (data.status === 1 && data.request) {
+        this._log('info', `ruCaptcha task submitted: ${data.request}`);
+        return data.request;
+      }
+      this._log('warn', `ruCaptcha submit failed: ${data.error_text || data.request || 'unknown'}`);
+      return null;
+    } catch (e) {
+      this._log('error', `ruCaptcha submit error: ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Poll ruCaptcha for the result. Waits up to ~120 seconds.
+   */
+  async _ruCaptchaPoll(apiKey, taskId) {
+    const host = 'rucaptcha.com';
+    const maxAttempts = 24; // 24 × 5s = 120s
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const url = `https://${host}/res.php?key=${apiKey}&action=get&id=${taskId}&json=1`;
+        const response = await this._httpGet(url);
+        const data = JSON.parse(response);
+
+        if (data.status === 1 && data.request) {
+          return data.request; // the answer
+        }
+        if (data.request === 'CAPCHA_NOT_READY') {
+          this._log('info', `ruCaptcha: waiting... (${i + 1}/${maxAttempts})`);
+          continue;
+        }
+        this._log('warn', `ruCaptcha poll error: ${data.error_text || data.request}`);
+        return null;
+      } catch (e) {
+        this._log('warn', `ruCaptcha poll exception: ${e.message}`);
+      }
+    }
+    this._log('warn', 'ruCaptcha: timeout waiting for answer');
+    return null;
+  }
+
+  /** Download an image URL and return base64 string. */
+  async _downloadImageAsBase64(imageUrl) {
+    try {
+      const data = await this._httpGetBuffer(imageUrl);
+      return data.toString('base64');
+    } catch (e) {
+      this._log('warn', `Image download failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  // ──────── HTTP Helpers ────────
+
+  _httpGet(url) {
+    return new Promise((resolve, reject) => {
+      https.get(url, (res) => {
+        let body = '';
+        res.on('data', d => body += d);
+        res.on('end', () => resolve(body));
+      }).on('error', reject);
+    });
+  }
+
+  _httpGetBuffer(url) {
+    return new Promise((resolve, reject) => {
+      const lib = url.startsWith('https') ? https : require('http');
+      lib.get(url, (res) => {
+        const chunks = [];
+        res.on('data', d => chunks.push(d));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      }).on('error', reject);
+    });
+  }
+
+  _httpPost(url, body) {
+    return new Promise((resolve, reject) => {
+      const u = new URL(url);
+      const options = {
+        hostname: u.hostname, port: u.port || 443, path: u.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      };
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', d => data += d);
+        res.on('end', () => resolve(data));
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
   }
 
   async _checkVKLogin(page) {
