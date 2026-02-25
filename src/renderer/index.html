@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VK Video Engagement Tool v1.0</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.1/css/all.min.css">
+</head>
+<body>
+    <div id="app">
+        <aside class="sidebar">
+            <div class="sidebar-logo">
+                <i class="fas fa-play-circle"></i>
+                <span>VK Video <small style="font-size:10px;opacity:0.6">v1.0</small></span>
+            </div>
+            <nav class="sidebar-nav">
+                <button class="nav-btn active" data-tab="tasks">
+                    <i class="fas fa-list-check"></i><span>Tasks</span>
+                </button>
+                <button class="nav-btn" data-tab="accounts">
+                    <i class="fas fa-users"></i><span>Accounts</span>
+                </button>
+                <button class="nav-btn" data-tab="proxies">
+                    <i class="fas fa-server"></i><span>Proxies</span>
+                </button>
+                <button class="nav-btn" data-tab="comments">
+                    <i class="fas fa-comments"></i><span>Comments</span>
+                </button>
+                <button class="nav-btn" data-tab="settings">
+                    <i class="fas fa-cog"></i><span>Settings</span>
+                </button>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="status-indicator" id="statusIndicator">
+                    <span class="status-dot idle"></span>
+                    <span>Idle</span>
+                </div>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="main-header">
+                <h1 id="pageTitle">Task Queue</h1>
+                <div class="header-actions" id="headerActions"></div>
+            </header>
+
+            <div class="tab-content">
+                <!-- TASKS -->
+                <section class="tab-page active" id="tab-tasks">
+                    <div class="actions-bar">
+                        <button class="btn btn-primary" id="btnCreateTask"><i class="fas fa-plus"></i> New Task</button>
+                        <button class="btn btn-success" id="btnStartAll"><i class="fas fa-play"></i> Start All</button>
+                        <button class="btn btn-danger" id="btnStopAll"><i class="fas fa-stop"></i> Stop All</button>
+                    </div>
+                    <div class="task-list" id="taskList">
+                        <div class="empty-state"><i class="fas fa-inbox"></i><p>No tasks yet</p></div>
+                    </div>
+                </section>
+
+                <!-- ACCOUNTS -->
+                <section class="tab-page" id="tab-accounts">
+                    <div class="actions-bar">
+                        <button class="btn btn-primary" id="btnImportLogpass"><i class="fas fa-key"></i> Import Login:Pass</button>
+                        <button class="btn btn-secondary" id="btnImportCookieText"><i class="fas fa-paste"></i> Paste Cookies</button>
+                        <button class="btn btn-secondary" id="btnImportCookieFiles"><i class="fas fa-file-import"></i> Import Files</button>
+                        <div style="margin-left:auto;display:flex;gap:6px">
+                            <button class="btn btn-sm btn-success" id="btnVerifyAll" title="Verify all"><i class="fas fa-check-double"></i> Verify All</button>
+                            <button class="btn btn-sm btn-success" id="btnVerifySelected" title="Verify selected"><i class="fas fa-check"></i> Verify</button>
+                            <button class="btn btn-sm btn-danger" id="btnRemoveSelected"><i class="fas fa-trash"></i> Remove</button>
+                            <button class="btn btn-sm btn-danger" id="btnRemoveInvalid"><i class="fas fa-ban"></i> Invalid</button>
+                        </div>
+                    </div>
+                    <div class="account-table-wrap">
+                        <table class="data-table" id="accountTable">
+                            <thead>
+                                <tr>
+                                    <th style="width:30px"><input type="checkbox" id="accSelectAll"></th>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Cookies</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="accountTableBody">
+                                <tr class="empty-row"><td colspan="6"><div class="empty-state"><i class="fas fa-users"></i><p>No accounts. Import login:pass or paste cookies.</p></div></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- PROXIES -->
+                <section class="tab-page" id="tab-proxies">
+                    <div class="actions-bar">
+                        <button class="btn btn-primary" id="btnAddProxy"><i class="fas fa-plus"></i> Add</button>
+                        <button class="btn btn-secondary" id="btnImportProxies"><i class="fas fa-file-import"></i> Import</button>
+                        <button class="btn btn-accent" id="btnBestProxies"><i class="fas fa-globe"></i> Best-Proxies.ru</button>
+                    </div>
+                    <!-- Best-Proxies.ru Panel -->
+                    <div class="bp-panel" id="bpPanel" style="display:none">
+                        <div class="bp-panel-header">
+                            <h3><i class="fas fa-globe"></i> Best-Proxies.ru API</h3>
+                            <button class="btn-icon" id="btnCloseBpPanel"><i class="fas fa-xmark"></i></button>
+                        </div>
+                        <div class="bp-panel-body">
+                            <!-- Row 1: Key + Format -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>API Key</label>
+                                    <input type="text" id="bpApiKey" placeholder="Premium key or 'developer'">
+                                </div>
+                                <div class="form-group">
+                                    <label>Format</label>
+                                    <select id="bpFormat">
+                                        <option value="json">JSON</option>
+                                        <option value="txt">TXT (ip:port)</option>
+                                        <option value="csv">CSV (Win-1251)</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <!-- Row 2: Type + Level -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Type</label>
+                                    <select id="bpType">
+                                        <option value="">All</option>
+                                        <option value="http">HTTP</option>
+                                        <option value="https">HTTPS</option>
+                                        <option value="socks4">SOCKS4</option>
+                                        <option value="socks5">SOCKS5</option>
+                                        <option value="http,https">HTTP+HTTPS</option>
+                                        <option value="socks4,socks5">SOCKS4+5</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Level</label>
+                                    <select id="bpLevel">
+                                        <option value="">All</option>
+                                        <option value="1">1 — High Anonymous</option>
+                                        <option value="1,2">1,2 — Anonymous+</option>
+                                        <option value="2">2 — Anonymous</option>
+                                        <option value="3">3 — Transparent</option>
+                                        <option value="1,2,3">All levels</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <!-- Row 3: Limit + Response -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Limit (max 15000)</label>
+                                    <input type="number" id="bpLimit" value="20" min="1" max="15000">
+                                </div>
+                                <div class="form-group">
+                                    <label>Response (ms)</label>
+                                    <input type="number" id="bpResponse" placeholder="e.g. 500">
+                                </div>
+                            </div>
+                            <!-- Row 4: Country + Speed -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Country (ISO)</label>
+                                    <input type="text" id="bpCountry" placeholder="e.g. ru,de,us">
+                                </div>
+                                <div class="form-group" style="flex:0.3">
+                                    <label><input type="checkbox" id="bpCex" style="width:auto"> Exclude</label>
+                                </div>
+                                <div class="form-group">
+                                    <label>Speed</label>
+                                    <select id="bpSpeed">
+                                        <option value="">All</option>
+                                        <option value="1">1 — Fast</option>
+                                        <option value="1,2">1,2 — Fast+Medium</option>
+                                        <option value="2">2 — Medium</option>
+                                        <option value="3">3 — Slow</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <!-- Row 5: DNSBL + Uptime -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>DNSBL (0-10)</label>
+                                    <input type="number" id="bpBl" placeholder="0 = cleanest" min="0" max="10">
+                                </div>
+                                <div class="form-group">
+                                    <label>Uptime (hours or "30m")</label>
+                                    <input type="text" id="bpUptime" placeholder="e.g. 1 or 30m">
+                                </div>
+                            </div>
+                            <!-- Row 6: Ports -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Ports</label>
+                                    <input type="text" id="bpPorts" placeholder="e.g. 80,1080,8080,3128,443">
+                                </div>
+                                <div class="form-group" style="flex:0.3">
+                                    <label><input type="checkbox" id="bpPex" style="width:auto"> Exclude</label>
+                                </div>
+                            </div>
+                            <!-- Row 7: Service Filters -->
+                            <p style="font-size:11px;color:var(--text-muted);margin:8px 0 6px">Service filters (proxy works with):</p>
+                            <div class="form-row" style="gap:12px;flex-wrap:wrap">
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpGoogle" style="width:auto"> Google</label>
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpMail" style="width:auto"> Mail.ru</label>
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpMailru" style="width:auto"> Mailru</label>
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpTelegram" style="width:auto"> Telegram</label>
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpAvito" style="width:auto"> Avito</label>
+                            </div>
+                            <!-- Row 8: Options -->
+                            <div class="form-row" style="margin-top:8px;gap:12px;flex-wrap:wrap">
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpIncludeType" style="width:auto"> Include type prefix (type://ip:port)</label>
+                                <label style="font-size:12px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="bpNocascade" style="width:auto"> No cascade (exact type match)</label>
+                            </div>
+                            <!-- Buttons -->
+                            <div class="form-row" style="gap:6px;margin-top:12px">
+                                <button class="btn btn-primary" id="btnBpFetch"><i class="fas fa-download"></i> Fetch Proxies</button>
+                                <button class="btn btn-secondary" id="btnBpStats"><i class="fas fa-chart-bar"></i> Stats</button>
+                                <button class="btn btn-secondary" id="btnBpKeyInfo"><i class="fas fa-clock"></i> Key Info</button>
+                                <button class="btn btn-danger btn-sm" id="btnBpClear"><i class="fas fa-trash"></i> Clear BP</button>
+                            </div>
+                            <div id="bpResult" style="margin-top:10px;font-size:12px;color:var(--text-secondary)"></div>
+                        </div>
+                    </div>
+                    <div class="data-table-wrap">
+                        <table class="data-table" id="proxyTable">
+                            <thead>
+                                <tr>
+                                    <th>Type</th><th>Host</th><th>Port</th><th>Country</th><th>Level</th><th>Source</th><th>Status</th><th>Latency</th><th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="proxyTableBody">
+                                <tr class="empty-row"><td colspan="9"><div class="empty-state"><i class="fas fa-server"></i><p>No proxies. Add manually or fetch from Best-Proxies.ru</p></div></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- COMMENTS -->
+                <section class="tab-page" id="tab-comments">
+                    <div class="actions-bar">
+                        <button class="btn btn-primary" id="btnQuickImportComments"><i class="fas fa-bolt"></i> Quick Import</button>
+                        <button class="btn btn-secondary" id="btnImportCommentsFile"><i class="fas fa-file-import"></i> From File</button>
+                        <button class="btn btn-secondary" id="btnAddComment"><i class="fas fa-plus"></i> Add</button>
+                        <span class="comment-counter" id="commentCounter">0</span>
+                        <div style="margin-left:auto"><button class="btn btn-sm btn-danger" id="btnRemoveSelectedComments"><i class="fas fa-trash"></i> Remove</button></div>
+                    </div>
+                    <div class="comment-list" id="commentList">
+                        <div class="empty-state"><i class="fas fa-comments"></i><p>No templates</p></div>
+                    </div>
+                </section>
+
+                <!-- SETTINGS -->
+                <section class="tab-page" id="tab-settings">
+                    <div class="settings-form">
+                        <div class="settings-group">
+                            <h3><i class="fas fa-globe"></i> Best-Proxies.ru</h3>
+                            <div class="form-group">
+                                <label>API Key (saved)</label>
+                                <input type="text" id="bestProxiesKey" placeholder="Premium key or 'developer'">
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <h3><i class="fas fa-robot"></i> ruCaptcha Key</h3>
+                            <p style="font-size:11px;color:var(--text-muted);margin-bottom:10px">For auto-solving VK captchas during login.</p>
+                            <div class="form-group">
+                                <label>ruCaptcha API Key</label>
+                                <input type="text" id="ruCaptchaKey" placeholder="Your ruCaptcha key">
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <h3><i class="fas fa-keyboard"></i> Typing Emulation</h3>
+                            <div class="form-row">
+                                <div class="form-group"><label>Delay min (ms)</label><input type="number" id="typingDelayMin" value="50"></div>
+                                <div class="form-group"><label>Delay max (ms)</label><input type="number" id="typingDelayMax" value="150"></div>
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <h3><i class="fas fa-eye"></i> Watch Duration</h3>
+                            <div class="form-row">
+                                <div class="form-group"><label>Min (sec)</label><input type="number" id="watchDurationMin" value="30"></div>
+                                <div class="form-group"><label>Max (sec)</label><input type="number" id="watchDurationMax" value="120"></div>
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <h3><i class="fas fa-bolt"></i> Parallel Execution</h3>
+                            <div class="form-group">
+                                <label>Max Concurrent Browsers</label>
+                                <input type="number" id="maxConcurrency" min="1" max="20" value="3">
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <h3><i class="fas fa-mug-hot"></i> Warm-Up Behavior</h3>
+                            <div class="form-row">
+                                <div class="form-group"><label>Home page min (sec)</label><input type="number" id="warmUpHomeMin" value="3"></div>
+                                <div class="form-group"><label>Home page max (sec)</label><input type="number" id="warmUpHomeMax" value="8"></div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group"><label>Scroll pause min (sec)</label><input type="number" id="warmUpScrollMin" value="1.5"></div>
+                                <div class="form-group"><label>Scroll pause max (sec)</label><input type="number" id="warmUpScrollMax" value="5"></div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group"><label>Video watch min (sec)</label><input type="number" id="warmUpVideoMin" value="5"></div>
+                                <div class="form-group"><label>Video watch max (sec)</label><input type="number" id="warmUpVideoMax" value="25"></div>
+                            </div>
+                            <p style="font-size:11px;color:var(--text-muted);margin-top:8px"><b>Scenario weights:</b></p>
+                            <div class="form-row" style="gap:6px">
+                                <div class="form-group"><label>Chill</label><input type="number" id="warmUpWChill" value="30"></div>
+                                <div class="form-group"><label>Curious</label><input type="number" id="warmUpWCurious" value="25"></div>
+                                <div class="form-group"><label>Explorer</label><input type="number" id="warmUpWExplorer" value="20"></div>
+                                <div class="form-group"><label>Searcher</label><input type="number" id="warmUpWSearcher" value="15"></div>
+                                <div class="form-group"><label>Impatient</label><input type="number" id="warmUpWImpatient" value="10"></div>
+                            </div>
+                        </div>
+                        <div class="settings-group">
+                            <h3><i class="fas fa-shield-halved"></i> Browser</h3>
+                            <div class="form-row">
+                                <div class="form-group checkbox-group"><label><input type="checkbox" id="headlessMode"><span>Headless (no window)</span></label></div>
+                            </div>
+                        </div>
+                        <button class="btn btn-primary" id="btnSaveSettings"><i class="fas fa-save"></i> Save</button>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Log Panel -->
+            <div class="log-panel" id="logPanel">
+                <div class="log-header">
+                    <span><i class="fas fa-terminal"></i> Log</span>
+                    <div class="log-controls">
+                        <button class="btn-icon" id="btnToggleLog"><i class="fas fa-chevron-down"></i></button>
+                        <button class="btn-icon" id="btnClearLog"><i class="fas fa-trash"></i></button>
+                    </div>
+                </div>
+                <div class="log-body" id="logBody">
+                    <div class="log-entry info"><span class="log-time">--:--:--</span><span class="log-msg">VK Video Engagement Tool v1.0 started. Best-Proxies.ru API + VK multi-account.</span></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal -->
+    <div class="modal-backdrop" id="modalBackdrop">
+        <div class="modal" id="modal">
+            <div class="modal-header">
+                <h2 id="modalTitle"></h2>
+                <button class="btn-icon modal-close" id="modalClose"><i class="fas fa-xmark"></i></button>
+            </div>
+            <div class="modal-body" id="modalBody"></div>
+            <div class="modal-footer" id="modalFooter"></div>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>

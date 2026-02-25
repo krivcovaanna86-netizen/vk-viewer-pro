@@ -1,0 +1,58 @@
+{
+  "name": "vk-video-engagement-tool",
+  "version": "1.0.0",
+  "description": "VK Video engagement tool — multi-account video viewing, likes, comments with Best-Proxies.ru integration",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --linux AppImage",
+    "build:win": "electron-builder --win portable",
+    "build:mac": "electron-builder --mac dmg",
+    "build:all": "electron-builder --linux AppImage --win portable"
+  },
+  "build": {
+    "appId": "com.vk-video-engagement.app",
+    "productName": "VK Video Engagement Tool",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "data",
+        "to": "data",
+        "filter": ["**/*"]
+      }
+    ],
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Utility",
+      "icon": "src/renderer/assets/icon.png"
+    },
+    "win": {
+      "target": ["portable"],
+      "icon": "src/renderer/assets/icon.png"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "src/renderer/assets/icon.png"
+    }
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0",
+    "fingerprint-generator": "^2.1.0",
+    "fingerprint-injector": "^2.1.0",
+    "playwright": "1.40.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^24.9.1"
+  }
+}
