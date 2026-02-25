@@ -2531,10 +2531,87 @@ class PlaywrightEngine {
     }
   }
 
+  /**
+   * Sets video playback speed to 0.25x using VK Video player settings.
+   * Sequence: click settings button → click "Скорость" → click "0.25"
+   * Fallback: directly set video.playbackRate = 0.25 via JS
+   */
+  async _setPlaybackSpeed025(page) {
+    this.log('[Speed] Setting playback speed to 0.25x...');
+    try {
+      // Method 1: Use player UI controls (matches codegen recording)
+      // Step 1: Click settings button (gear icon)
+      const settingsBtn = page.locator('[data-testid="settings-btn"]').first();
+      let uiSuccess = false;
+
+      if (await settingsBtn.isVisible({ timeout: 5000 })) {
+        await settingsBtn.click();
+        this.log('[Speed] Clicked settings button');
+        await this._humanDelay(500, 1000);
+
+        // Step 2: Click "Скорость" menu item
+        const speedItem = page.getByText('Скорость').first();
+        if (await speedItem.isVisible({ timeout: 3000 })) {
+          await speedItem.click();
+          this.log('[Speed] Clicked "Скорость" menu item');
+          await this._humanDelay(500, 1000);
+
+          // Step 3: Click "0.25"
+          const speed025 = page.getByText('0.25').first();
+          if (await speed025.isVisible({ timeout: 3000 })) {
+            await speed025.click();
+            this.log('[Speed] ✅ Set speed to 0.25x via UI');
+            uiSuccess = true;
+            await this._humanDelay(300, 600);
+          } else {
+            this.log('[Speed] 0.25 option not visible');
+          }
+        } else {
+          this.log('[Speed] "Скорость" menu not visible');
+          // Close settings if opened
+          await page.keyboard.press('Escape');
+        }
+      } else {
+        this.log('[Speed] Settings button not found');
+      }
+
+      // Method 2: Fallback — directly set playbackRate via JS
+      if (!uiSuccess) {
+        this.log('[Speed] Falling back to JS playbackRate...');
+        const jsResult = await page.evaluate(() => {
+          const videos = document.querySelectorAll('video');
+          let set = false;
+          for (const v of videos) {
+            v.playbackRate = 0.25;
+            set = true;
+          }
+          return { set, count: videos.length };
+        });
+        if (jsResult.set) {
+          this.log(`[Speed] ✅ Set playbackRate=0.25 via JS on ${jsResult.count} video(s)`);
+        } else {
+          this.log('[Speed] ⚠️ No video elements found for JS fallback');
+        }
+      }
+    } catch (e) {
+      this.log(`[Speed] Error: ${e.message}`);
+      // Last resort JS fallback
+      await page.evaluate(() => {
+        document.querySelectorAll('video').forEach(v => { v.playbackRate = 0.25; });
+      }).catch(() => {});
+    }
+  }
+
   async pressLike(page) {
     this.log('[Like] Attempting to like...');
     try {
+      // VKVideo uses data-testid attributes for buttons
+      // video_page_like_button = on the video page (full view)
+      // video_modal_like_button = on the modal (overlay) player
       const likeSelectors = [
+        '[data-testid="video_page_like_button"]',
+        '[data-testid="video_modal_like_button"]',
+        '[data-testid="like_button"]',
         '.like_btn:not(.active)',
         'button[class*="like"]:not(.active)',
         '[data-like-id]',
@@ -2637,6 +2714,8 @@ class PlaywrightEngine {
       searchKeywords,
       useSearch = false,
       accountIds = [],
+      proxyIds = [],
+      slowSpeed = false,
     } = task;
 
     if (!videoUrl) {
@@ -2645,7 +2724,8 @@ class PlaywrightEngine {
 
     this.log(`[Task] Starting engagement task for: ${videoUrl}`);
     this.log(`[Task] Views: ${viewCount}, Likes: ${likeCount}, Comments: ${commentCount}`);
-    this.log(`[Task] Mode: ${useSearch ? 'search' : 'direct'}, Accounts: ${accountIds.length}`);
+    this.log(`[Task] Mode: ${useSearch ? 'search' : 'direct'}, Accounts: ${accountIds.length}, Proxies: ${proxyIds.length}`);
+    this.log(`[Task] Slow speed (0.25x): ${slowSpeed ? 'YES' : 'no'}`);
 
     const accounts = this.store.get('accounts') || [];
     const comments = this.store.get('comments') || [];
@@ -2653,25 +2733,42 @@ class PlaywrightEngine {
 
     // Build operation plan
     const ops = [];
-    let opIndex = 0;
     
     for (let i = 0; i < Math.max(viewCount, likeCount, commentCount); i++) {
       const accountId = accountIds[i % accountIds.length];
       const account = accounts.find(a => a.id === accountId);
       if (!account) continue;
 
+      // Assign proxy: round-robin from task.proxyIds, fall back to account.proxyId
+      let proxyId = null;
+      if (proxyIds.length > 0) {
+        proxyId = proxyIds[i % proxyIds.length];
+      } else if (account.proxyId) {
+        proxyId = account.proxyId;
+      }
+
       ops.push({
         accountId,
-        proxyId: account.proxyId || null,
+        proxyId,
         shouldLike: i < likeCount,
         shouldComment: i < commentCount,
         commentText: i < commentCount && comments.length > 0 
           ? comments[Math.floor(Math.random() * comments.length)]?.text || ''
           : '',
+        slowSpeed,
       });
     }
 
     this.log(`[Task] Total operations: ${ops.length}, Concurrency: ${maxConcurrency}`);
+    if (proxyIds.length > 0) {
+      const proxyList = this.store.get('proxies') || [];
+      for (const pid of proxyIds) {
+        const px = proxyList.find(p => p.id === pid);
+        if (px) this.log(`[Task] Proxy: ${px.type}://${px.host}:${px.port} (${px.country || px.countryCode || '?'}) status=${px.status}`);
+      }
+    } else {
+      this.log('[Task] ⚠️ No proxies selected for this task');
+    }
 
     const results = { views: 0, likes: 0, comments: 0, errors: 0 };
 
@@ -2723,7 +2820,7 @@ class PlaywrightEngine {
   }
 
   async _executeSingleOp(op, task, settings) {
-    const { accountId, proxyId, shouldLike, shouldComment, commentText } = op;
+    const { accountId, proxyId, shouldLike, shouldComment, commentText, slowSpeed } = op;
     const { videoUrl, searchKeywords, useSearch } = task;
     const opStart = Date.now();
 
@@ -2859,6 +2956,11 @@ class PlaywrightEngine {
       }
       this.log(`[Op] Navigation to video took ${((Date.now() - navStart) / 1000).toFixed(1)}s`);
       this.log(`[Op] Current URL: ${page.url().substring(0, 100)}`);
+
+      // ── Set 0.25x speed if requested ──
+      if (slowSpeed) {
+        await this._setPlaybackSpeed025(page);
+      }
 
       // ── Watch video ──
       const watchDuration = this._randomDelay(

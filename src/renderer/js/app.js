@@ -714,6 +714,7 @@ function renderTasks() {
         <span><i class="fas fa-server"></i> ${t.proxyIds?.length || 0} proxies</span>
         <span><i class="fas fa-clock"></i> ${formatDate(t.createdAt)}</span>
         ${t.useSearch ? `<span><i class="fas fa-search"></i> "${escapeHtml(t.searchKeywords || '')}"</span>` : ''}
+        ${t.slowSpeed ? `<span><i class="fas fa-gauge-simple"></i> 0.25x</span>` : ''}
       </div>
       <div class="task-progress"><div class="task-progress-bar" style="width:${pct}%"></div></div>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">${pct}% — ${t.completedItems || 0}/${t.totalItems || t.viewCount} ops (${t.successItems || 0} ok, ${t.errorItems || 0} err)</div>
@@ -788,6 +789,9 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
     <div class="form-group checkbox-group">
       <label><input type="checkbox" id="taskAllowDirect"><span>Allow direct connection (no proxy)</span></label>
     </div>
+    <div class="form-group checkbox-group">
+      <label><input type="checkbox" id="taskSlowSpeed"><span>Slow playback speed (0.25x) — longer watch, more retention</span></label>
+    </div>
     <div class="form-group">
       <label>Accounts</label>
       <div style="max-height:120px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px">
@@ -831,6 +835,7 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
     const searchKeywords = document.getElementById('taskSearchKeywords').value.trim();
     const commentFolderId = document.getElementById('taskCommentFolder').value || null;
     const allowDirect = document.getElementById('taskAllowDirect').checked;
+    const slowSpeed = document.getElementById('taskSlowSpeed').checked;
     const accountIds = [...document.querySelectorAll('.task-acc-cb:checked')].map(cb => cb.value);
     const proxyIds = [...document.querySelectorAll('.task-proxy-cb:checked')].map(cb => cb.value);
 
@@ -842,7 +847,7 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
       await window.api.task.create({
         videoUrl, viewCount, likeCount, commentCount,
         useSearch, searchKeywords, commentFolderId,
-        allowDirect, accountIds, proxyIds,
+        allowDirect, slowSpeed, accountIds, proxyIds,
       });
       showToast('Task created', 'success');
       closeModal();

@@ -37,6 +37,7 @@ class TaskQueue extends EventEmitter {
       accountIds: task.accountIds || [],
       proxyIds: task.proxyIds || [],
       allowDirect: !!task.allowDirect,
+      slowSpeed: !!task.slowSpeed,
       commentFolderId: task.commentFolderId || null,
       type: 'engagement',
       status: 'pending',

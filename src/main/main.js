@@ -369,7 +369,7 @@ function setupIPC() {
   ipcMain.handle('task:create', async (_, task) => {
     const enrichedTask = { ...task };
     const r = taskQueue.create(enrichedTask);
-    sendLog('info', `Task created: Views=${task.viewCount}, Likes=${task.likeCount}, Comments=${task.commentCount}, Accounts=${task.accountIds?.length || 0}`);
+    sendLog('info', `Task created: Views=${task.viewCount}, Likes=${task.likeCount}, Comments=${task.commentCount}, Accounts=${task.accountIds?.length || 0}, Proxies=${task.proxyIds?.length || 0}, Speed=${task.slowSpeed ? '0.25x' : 'normal'}`);
     return r;
   });
   ipcMain.handle('task:remove', (_, id) => taskQueue.remove(id));
