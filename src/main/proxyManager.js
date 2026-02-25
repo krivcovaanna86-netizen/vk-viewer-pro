@@ -151,6 +151,17 @@ class ProxyManager {
    */
   async fetchFromBestProxies(options = {}) {
     if (!options.key) throw new Error('Best-Proxies API key is required');
+    
+    // Validate and clean the key
+    const cleanKey = options.key.trim();
+    // Best-Proxies keys are alphanumeric strings, not cyrillic text
+    if (!/^[a-zA-Z0-9_\-]+$/.test(cleanKey) && cleanKey !== 'developer') {
+      throw new Error(
+        'Invalid API key format. The key should contain only latin characters and numbers (e.g. "abc123def456"). ' +
+        'Get your key at https://best-proxies.ru/buy/'
+      );
+    }
+    options.key = cleanKey;
 
     await this._bpRateLimit();
 

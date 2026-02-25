@@ -2279,37 +2279,59 @@ class PlaywrightEngine {
 
           this.log(`[Search] Results page: ${page.url().substring(0, 80)}`);
 
-          // Scroll through results to load more
-          for (let scroll = 0; scroll < 4; scroll++) {
-            await page.mouse.wheel(0, this._randomDelay(300, 600));
-            await this._humanDelay(1500, 2500);
+          // Scroll through results to load more (VKVideo lazy-loads)
+          for (let scroll = 0; scroll < 8; scroll++) {
+            await page.mouse.wheel(0, this._randomDelay(400, 800));
+            await this._humanDelay(1000, 2000);
           }
+          // Scroll back up a bit
+          await page.mouse.wheel(0, -300);
+          await this._humanDelay(500, 1000);
 
           // Look for the target video in results
           if (targetVideoId) {
-            this.log(`[Search] Scanning results for video ID: ${targetVideoId}`);
-            const found = await page.evaluate((videoId) => {
-              const links = document.querySelectorAll('a[href*="/video"], a[href*="video-"]');
-              const allHrefs = [];
+            // Extract the numeric part for broader matching: "-224119603_456311034"
+            const idParts = targetVideoId.match(/(-?\d+_\d+)/);
+            const numericId = idParts ? idParts[1] : targetVideoId;
+            this.log(`[Search] Scanning results for: "${targetVideoId}" (numeric: "${numericId}")`);
+            
+            const found = await page.evaluate(({ videoId, numId }) => {
+              // Collect ALL links broadly
+              const links = document.querySelectorAll('a[href]');
+              const videoLinks = [];
               for (const link of links) {
                 const href = link.href || link.getAttribute('href') || '';
-                if (href.includes(videoId)) {
-                  link.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                  link.click();
-                  return { found: true, href, total: links.length };
+                // Check if this is a video link
+                if (href.includes('video') || href.includes(numId)) {
+                  videoLinks.push({ el: link, href });
                 }
-                if (href.includes('video')) allHrefs.push(href.substring(0, 80));
               }
-              return { found: false, total: links.length, sample: allHrefs.slice(0, 5) };
-            }, targetVideoId);
+              
+              // First pass: exact video ID match
+              for (const { el, href } of videoLinks) {
+                if (href.includes(videoId) || href.includes(numId)) {
+                  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  el.click();
+                  return { found: true, href, total: videoLinks.length, method: 'exact' };
+                }
+              }
+              
+              // Return sample for debugging
+              return { 
+                found: false, 
+                total: videoLinks.length, 
+                sample: videoLinks.slice(0, 10).map(v => v.href.substring(0, 100)),
+              };
+            }, { videoId: targetVideoId, numId: numericId });
 
             if (found.found) {
-              this.log(`[Search] ✅ Found target video in results (${found.total} links scanned): ${found.href}`);
+              this.log(`[Search] ✅ Found target video (${found.method}) in results (${found.total} links): ${found.href}`);
               await this._humanDelay(2000, 3000);
               return true;
             }
             
-            this.log(`[Search] Target video not in results (${found.total} links scanned). Sample: ${JSON.stringify(found.sample || [])}`);
+            this.log(`[Search] Target video not in results (${found.total} video links). Sample hrefs:`);
+            (found.sample || []).forEach((h, i) => this.log(`[Search]   ${i}: ${h}`));
           }
         } else {
           this.log('[Search] ⚠️ Search input not found on page');
@@ -2354,124 +2376,132 @@ class PlaywrightEngine {
     
     this.log(`[Watch] Target watch time: ${watchTime}s (range ${watchMin}-${watchMax}s)`);
     
+    // Shadow DOM helper — VK uses <vk-video-player> Web Component
+    const FIND_VIDEOS_JS = `
+      function _findVideos(root) {
+        const found = [];
+        for (const el of root.querySelectorAll('*')) {
+          if (el.tagName === 'VIDEO') found.push(el);
+          if (el.shadowRoot) found.push(..._findVideos(el.shadowRoot));
+        }
+        return found;
+      }
+    `;
+
     try {
-      // ── Step 0: Wait for video element to appear ──
-      this.log('[Watch] Waiting for <video> element...');
-      let videoFound = false;
+      // ── Step 0: Get duration from page UI (data-testid="video_duration") ──
+      let pageDuration = null;
       try {
-        await page.waitForSelector('video', { timeout: 10000, state: 'attached' });
-        videoFound = true;
-        this.log('[Watch] <video> element found in DOM');
-      } catch (e) {
-        this.log('[Watch] ⚠️ No <video> element found after 10s');
-      }
-
-      // ── Step 1: Get initial video state ──
-      if (videoFound) {
-        const initialState = await page.evaluate(() => {
-          const videos = document.querySelectorAll('video');
-          return Array.from(videos).map((v, i) => ({
-            index: i,
-            src: (v.src || v.currentSrc || '').substring(0, 80),
-            readyState: v.readyState,
-            paused: v.paused,
-            muted: v.muted,
-            duration: isFinite(v.duration) ? Math.round(v.duration) : 'unknown',
-            currentTime: Math.round(v.currentTime),
-            width: v.videoWidth,
-            height: v.videoHeight,
-          }));
-        }).catch(() => []);
-        this.log(`[Watch] Video elements: ${JSON.stringify(initialState)}`);
-      }
-
-      // ── Step 2: Click to start playback ──
-      try {
-        const videoEl = page.locator('video').first();
-        if (await videoEl.isVisible({ timeout: 3000 })) {
-          await videoEl.click();
-          await this._humanDelay(500, 1000);
-          this.log('[Watch] Clicked <video> element');
+        const durSpan = page.getByTestId('video_duration');
+        if (await durSpan.isVisible({ timeout: 3000 })) {
+          const durText = await durSpan.textContent();
+          this.log(`[Watch] Duration from UI: "${durText}"`);
+          const parts = durText.trim().split(':').map(Number);
+          if (parts.length === 2) pageDuration = parts[0] * 60 + parts[1];
+          else if (parts.length === 3) pageDuration = parts[0] * 3600 + parts[1] * 60 + parts[2];
+          if (pageDuration) this.log(`[Watch] Parsed duration: ${pageDuration}s`);
         }
       } catch (e) {}
 
-      // ── Step 3: Force play + mute (allows autoplay) ──
+      // ── Step 1: Wait for video element (Playwright locator pierces Shadow DOM) ──
+      this.log('[Watch] Looking for <video> element (with Shadow DOM piercing)...');
+      let videoFound = false;
+      try {
+        const videoLocator = page.locator('video').first();
+        await videoLocator.waitFor({ state: 'attached', timeout: 10000 });
+        videoFound = true;
+        this.log('[Watch] <video> found via Playwright locator');
+      } catch (e) {
+        // Manual shadow DOM traversal
+        const jsCount = await page.evaluate(() => {
+          function _fv(root) { const f=[]; for(const el of root.querySelectorAll('*')){ if(el.tagName==='VIDEO')f.push(el); if(el.shadowRoot)f.push(..._fv(el.shadowRoot)); } return f; }
+          return _fv(document).length;
+        }).catch(() => 0);
+        if (jsCount > 0) {
+          videoFound = true;
+          this.log(`[Watch] Found ${jsCount} video(s) via JS shadow DOM traversal`);
+        } else {
+          this.log('[Watch] \u26a0\ufe0f No <video> element found');
+        }
+      }
+
+      // ── Step 2: Click player area to start playback ──
+      try {
+        const playerArea = page.locator('vk-video-player, [class*="VideoPlayer__player"]').first();
+        if (await playerArea.isVisible({ timeout: 3000 })) {
+          await playerArea.click();
+          await this._humanDelay(500, 1000);
+          this.log('[Watch] Clicked player area');
+        }
+      } catch (e) {}
+
+      // ── Step 3: Force play via JS (traverse shadow DOM) ──
       const playResult = await page.evaluate(() => {
-        const videos = document.querySelectorAll('video');
+        function _fv(root) { const f=[]; for(const el of root.querySelectorAll('*')){ if(el.tagName==='VIDEO')f.push(el); if(el.shadowRoot)f.push(..._fv(el.shadowRoot)); } return f; }
+        const videos = _fv(document);
         const results = [];
         for (const video of videos) {
           video.muted = true;
-          // Remove overlays that might block playback
-          document.querySelectorAll(
-            '[class*="overlay"], [class*="Overlay"], [class*="promo"], [class*="Promo"]'
-          ).forEach(el => { if (el.style) el.style.display = 'none'; });
-          
           try { video.play(); } catch (e) {}
-          
           results.push({
             paused: video.paused,
             duration: isFinite(video.duration) ? Math.round(video.duration) : -1,
             currentTime: Math.round(video.currentTime),
             readyState: video.readyState,
+            src: (video.src || video.currentSrc || '').substring(0, 60),
           });
         }
+        // Remove overlays
+        document.querySelectorAll('[class*="overlay"],[class*="Overlay"],[class*="promo"]')
+          .forEach(el => { if (el.style) el.style.display = 'none'; });
         return results;
       }).catch(() => []);
 
-      const mainVideo = playResult[0];
-      if (mainVideo) {
-        const durStr = mainVideo.duration > 0 ? `${mainVideo.duration}s` : 'unknown';
-        this.log(`[Watch] After play(): paused=${mainVideo.paused}, duration=${durStr}, readyState=${mainVideo.readyState}`);
+      if (playResult.length > 0) {
+        this.log(`[Watch] Video state: ${JSON.stringify(playResult)}`);
       }
 
-      // ── Step 4: Click play button if video still not playing ──
-      if (!mainVideo || mainVideo.paused) {
-        const playSelectors = [
-          'button[class*="play" i]',
-          '[class*="videoplayer"] button',
-          'button[aria-label*="Play"]',
-          'button[aria-label*="Воспроизвести"]',
-          '[class*="PlayerButton"]',
-          '.videoplayer_btn_play',
-        ];
-        for (const sel of playSelectors) {
-          try {
-            const btn = page.locator(sel).first();
-            if (await btn.isVisible({ timeout: 1500 })) {
-              await btn.click();
-              this.log(`[Watch] Clicked play button: ${sel}`);
-              await this._humanDelay(500, 1000);
-              break;
-            }
-          } catch (e) {}
-        }
+      const mainVideo = playResult[0];
+      if (mainVideo) {
+        const durStr = mainVideo.duration > 0 ? `${mainVideo.duration}s` : (pageDuration ? `${pageDuration}s (UI)` : 'unknown');
+        this.log(`[Watch] Status: paused=${mainVideo.paused}, duration=${durStr}, readyState=${mainVideo.readyState}`);
+      }
 
-        // Final force play
+      // ── Step 4: Click play if still paused ──
+      if (!mainVideo || mainVideo.paused) {
+        try {
+          const playBtn = page.getByRole('button', { name: /play|воспроизвести/i }).first();
+          if (await playBtn.isVisible({ timeout: 2000 })) {
+            await playBtn.click();
+            this.log('[Watch] Clicked play via getByRole');
+            await this._humanDelay(500, 1000);
+          }
+        } catch (e) {}
+        // Click player area again
+        try {
+          await page.locator('vk-video-player').first().click();
+          this.log('[Watch] Clicked vk-video-player');
+        } catch (e) {}
+        // Force play JS
         await page.evaluate(() => {
-          document.querySelectorAll('video').forEach(v => {
-            v.muted = true;
-            try { v.play(); } catch (e) {}
-          });
+          function _fv(r){const f=[];for(const e of r.querySelectorAll('*')){if(e.tagName==='VIDEO')f.push(e);if(e.shadowRoot)f.push(..._fv(e.shadowRoot))}return f}
+          _fv(document).forEach(v=>{v.muted=true;try{v.play()}catch(e){}});
         }).catch(() => {});
       }
 
-      // ── Step 5: Wait for metadata to load (duration becomes available) ──
-      if (videoFound) {
-        try {
-          await page.waitForFunction(() => {
-            const v = document.querySelector('video');
-            return v && isFinite(v.duration) && v.duration > 0;
-          }, { timeout: 8000 });
-          this.log('[Watch] Video metadata loaded');
-        } catch (e) {
-          this.log('[Watch] ⚠️ Video duration still unavailable after 8s');
-        }
-      }
+      // ── Step 5: Check playback state attribute ──
+      try {
+        const pbState = await page.evaluate(() => {
+          const el = document.querySelector('[data-playback-state]');
+          return el ? el.getAttribute('data-playback-state') : null;
+        });
+        if (pbState) this.log(`[Watch] data-playback-state: "${pbState}"`);
+      } catch (e) {}
 
-      // ── Step 6: Watch loop with human-like behavior ──
+      // ── Step 6: Watch loop ──
       const startTime = Date.now();
       let lastProgressCheck = 0;
-      let videoDuration = 'unknown';
+      let videoDuration = pageDuration ? `${pageDuration}s` : 'unknown';
       
       while ((Date.now() - startTime) / 1000 < watchTime) {
         if (page.isClosed()) {
@@ -2479,51 +2509,47 @@ class PlaywrightEngine {
           break;
         }
         
-        // Periodic check every 15s
         const elapsed = Math.round((Date.now() - startTime) / 1000);
         if (elapsed - lastProgressCheck >= 15) {
           lastProgressCheck = elapsed;
           try {
             const status = await page.evaluate(() => {
-              const v = document.querySelector('video');
+              function _fv(r){const f=[];for(const e of r.querySelectorAll('*')){if(e.tagName==='VIDEO')f.push(e);if(e.shadowRoot)f.push(..._fv(e.shadowRoot))}return f}
+              const v = _fv(document)[0];
               if (!v) return { found: false };
               if (v.paused && !v.ended) { v.muted = true; try { v.play(); } catch (e) {} }
               return { 
-                found: true, 
-                paused: v.paused, 
-                ended: v.ended,
+                found: true, paused: v.paused, ended: v.ended,
                 currentTime: Math.round(v.currentTime),
                 duration: isFinite(v.duration) ? Math.round(v.duration) : -1,
-                readyState: v.readyState,
+                readyState: v.readyState, playbackRate: v.playbackRate,
                 buffered: v.buffered.length > 0 ? Math.round(v.buffered.end(v.buffered.length - 1)) : 0,
               };
             });
             if (status.found) {
-              const durStr = status.duration > 0 ? `${status.duration}s` : '?';
-              videoDuration = durStr;
+              const durStr = status.duration > 0 ? `${status.duration}s` : videoDuration;
+              if (status.duration > 0) videoDuration = `${status.duration}s`;
               const state = status.paused ? 'PAUSED' : status.ended ? 'ENDED' : 'PLAYING';
-              this.log(`[Watch] ${elapsed}s/${watchTime}s — video: ${status.currentTime}s/${durStr} [${state}] buffered:${status.buffered}s readyState:${status.readyState}`);
+              this.log(`[Watch] ${elapsed}s/${watchTime}s \u2014 video: ${status.currentTime}s/${durStr} [${state}] rate:${status.playbackRate} buf:${status.buffered}s`);
             } else {
-              this.log(`[Watch] ${elapsed}s/${watchTime}s — no <video> element found`);
+              const pbState = await page.evaluate(() => {
+                const el = document.querySelector('[data-playback-state]');
+                return el ? el.getAttribute('data-playback-state') : '?';
+              }).catch(() => '?');
+              this.log(`[Watch] ${elapsed}s/${watchTime}s \u2014 no video via JS, state: ${pbState}, dur: ${videoDuration}`);
             }
           } catch (e) {}
         }
         
-        // Random mouse movement (keep page "alive")
         const x = this._randomDelay(200, 1700);
         const y = this._randomDelay(200, 800);
         await page.mouse.move(x, y);
-        
-        // Occasional small scroll (like a real user)
-        if (Math.random() < 0.08) {
-          await page.mouse.wheel(0, this._randomDelay(-50, 50));
-        }
-        
+        if (Math.random() < 0.08) await page.mouse.wheel(0, this._randomDelay(-50, 50));
         await this._humanDelay(3000, 8000);
       }
       
       const totalWatched = Math.round((Date.now() - startTime) / 1000);
-      this.log(`[Watch] ✅ Done — watched ${totalWatched}s (target was ${watchTime}s), video duration: ${videoDuration}`);
+      this.log(`[Watch] \u2705 Done \u2014 watched ${totalWatched}s (target ${watchTime}s), duration: ${videoDuration}`);
       return true;
     } catch (error) {
       this.log(`[Watch] Error: ${error.message}`);
@@ -2533,53 +2559,108 @@ class PlaywrightEngine {
 
   /**
    * Sets video playback speed to 0.25x using VK Video player settings.
-   * Sequence: click settings button → click "Скорость" → click "0.25"
-   * Fallback: directly set video.playbackRate = 0.25 via JS
+   * 
+   * IMPORTANT: VK Video uses <vk-video-player> Web Component with Shadow DOM.
+   * All player controls (settings, play, timeline) are INSIDE the shadow root.
+   * - page.getByTestId() pierces shadow DOM automatically
+   * - page.getByText() pierces shadow DOM automatically  
+   * - page.locator('[attr]') does NOT pierce shadow DOM
+   * - document.querySelector() in evaluate does NOT pierce shadow DOM
+   * 
+   * Sequence: click settings-btn → click "Скорость" → click "0.25"
+   * Fallback: find <video> inside shadow root and set playbackRate = 0.25
    */
   async _setPlaybackSpeed025(page) {
     this.log('[Speed] Setting playback speed to 0.25x...');
     try {
-      // Method 1: Use player UI controls (matches codegen recording)
-      // Step 1: Click settings button (gear icon)
-      const settingsBtn = page.locator('[data-testid="settings-btn"]').first();
+      // First: hover/click on player area to make controls visible
+      try {
+        const playerArea = page.locator('vk-video-player, [class*="VideoPlayer"]').first();
+        if (await playerArea.isVisible({ timeout: 3000 })) {
+          await playerArea.hover();
+          await this._humanDelay(500, 1000);
+          this.log('[Speed] Hovered over player to show controls');
+        }
+      } catch (e) {}
+
+      // Method 1: Use getByTestId (pierces Shadow DOM automatically)
       let uiSuccess = false;
-
-      if (await settingsBtn.isVisible({ timeout: 5000 })) {
-        await settingsBtn.click();
-        this.log('[Speed] Clicked settings button');
-        await this._humanDelay(500, 1000);
-
-        // Step 2: Click "Скорость" menu item
-        const speedItem = page.getByText('Скорость').first();
-        if (await speedItem.isVisible({ timeout: 3000 })) {
-          await speedItem.click();
-          this.log('[Speed] Clicked "Скорость" menu item');
+      try {
+        const settingsBtn = page.getByTestId('settings-btn');
+        if (await settingsBtn.isVisible({ timeout: 5000 })) {
+          await settingsBtn.click();
+          this.log('[Speed] Clicked settings button (via getByTestId)');
           await this._humanDelay(500, 1000);
 
-          // Step 3: Click "0.25"
-          const speed025 = page.getByText('0.25').first();
-          if (await speed025.isVisible({ timeout: 3000 })) {
-            await speed025.click();
-            this.log('[Speed] ✅ Set speed to 0.25x via UI');
-            uiSuccess = true;
-            await this._humanDelay(300, 600);
+          // Click "Скорость" — getByText also pierces shadow DOM
+          const speedItem = page.getByText('Скорость', { exact: false });
+          if (await speedItem.first().isVisible({ timeout: 3000 })) {
+            await speedItem.first().click();
+            this.log('[Speed] Clicked "Скорость" menu item');
+            await this._humanDelay(500, 1000);
+
+            // Click "0.25"
+            const speed025 = page.getByText('0.25', { exact: true });
+            if (await speed025.isVisible({ timeout: 3000 })) {
+              await speed025.click();
+              this.log('[Speed] ✅ Set speed to 0.25x via UI');
+              uiSuccess = true;
+              await this._humanDelay(300, 600);
+            } else {
+              this.log('[Speed] 0.25 option not visible');
+              await page.keyboard.press('Escape');
+            }
           } else {
-            this.log('[Speed] 0.25 option not visible');
+            this.log('[Speed] "Скорость" menu not visible');
+            await page.keyboard.press('Escape');
           }
         } else {
-          this.log('[Speed] "Скорость" menu not visible');
-          // Close settings if opened
-          await page.keyboard.press('Escape');
+          this.log('[Speed] settings-btn not visible (controls may be hidden)');
         }
-      } else {
-        this.log('[Speed] Settings button not found');
+      } catch (e) {
+        this.log(`[Speed] UI method error: ${e.message.substring(0, 80)}`);
       }
 
-      // Method 2: Fallback — directly set playbackRate via JS
+      // Method 2: Fallback — find video inside shadow DOM and set playbackRate via JS
       if (!uiSuccess) {
-        this.log('[Speed] Falling back to JS playbackRate...');
+        this.log('[Speed] Falling back to JS playbackRate (with shadow DOM traversal)...');
         const jsResult = await page.evaluate(() => {
-          const videos = document.querySelectorAll('video');
+          // Try 1: direct querySelectorAll (works if no shadow DOM)
+          let videos = document.querySelectorAll('video');
+          
+          // Try 2: traverse shadow roots to find video elements
+          if (videos.length === 0) {
+            const players = document.querySelectorAll('vk-video-player');
+            for (const player of players) {
+              if (player.shadowRoot) {
+                const sv = player.shadowRoot.querySelectorAll('video');
+                if (sv.length > 0) videos = sv;
+              }
+              // Also check nested shadow-root-container
+              const containers = player.querySelectorAll('.shadow-root-container, .root-container');
+              for (const c of containers) {
+                if (c.shadowRoot) {
+                  const sv2 = c.shadowRoot.querySelectorAll('video');
+                  if (sv2.length > 0) videos = sv2;
+                }
+              }
+            }
+          }
+          
+          // Try 3: Deep shadow DOM traversal
+          if (videos.length === 0) {
+            function findVideosInShadow(root) {
+              const found = [];
+              const all = root.querySelectorAll('*');
+              for (const el of all) {
+                if (el.tagName === 'VIDEO') found.push(el);
+                if (el.shadowRoot) found.push(...findVideosInShadow(el.shadowRoot));
+              }
+              return found;
+            }
+            videos = findVideosInShadow(document);
+          }
+          
           let set = false;
           for (const v of videos) {
             v.playbackRate = 0.25;
@@ -2590,14 +2671,22 @@ class PlaywrightEngine {
         if (jsResult.set) {
           this.log(`[Speed] ✅ Set playbackRate=0.25 via JS on ${jsResult.count} video(s)`);
         } else {
-          this.log('[Speed] ⚠️ No video elements found for JS fallback');
+          this.log('[Speed] ⚠️ No video elements found even in shadow DOM');
         }
       }
     } catch (e) {
       this.log(`[Speed] Error: ${e.message}`);
-      // Last resort JS fallback
+      // Last resort
       await page.evaluate(() => {
-        document.querySelectorAll('video').forEach(v => { v.playbackRate = 0.25; });
+        function findVideos(root) {
+          const found = [];
+          for (const el of root.querySelectorAll('*')) {
+            if (el.tagName === 'VIDEO') found.push(el);
+            if (el.shadowRoot) found.push(...findVideos(el.shadowRoot));
+          }
+          return found;
+        }
+        findVideos(document).forEach(v => { v.playbackRate = 0.25; });
       }).catch(() => {});
     }
   }
