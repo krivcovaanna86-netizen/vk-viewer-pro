@@ -78,8 +78,12 @@ class PlaywrightEngine {
   _buildProxyUrl(proxyData) {
     if (!proxyData) return null;
     try {
-      const { host, port, username, password, protocol } = proxyData;
-      const proto = protocol || 'http';
+      const { host, port, username, password, type } = proxyData;
+      // proxyManager stores the protocol in .type (http/https/socks4/socks5), not .protocol
+      // For Playwright: socks4 → socks5, https → http (Playwright proxy needs plain protocol)
+      let proto = (type || 'http').toLowerCase();
+      if (proto === 'https') proto = 'http';
+      if (proto === 'socks4') proto = 'socks5';
       if (username && password) {
         const u = encodeURIComponent(username);
         const p = encodeURIComponent(password);
@@ -334,22 +338,40 @@ class PlaywrightEngine {
    * and checks if the page actually navigated.
    */
   async _safeGoto(page, url, opts = {}) {
-    const timeout = opts.timeout || 30000;
+    // Base timeout + proxy latency buffer: slow proxies (e.g., 5.5s ping) need extra time
+    const baseTimeout = opts.timeout || 30000;
+    const proxyBuffer = opts.proxyLatency ? Math.min(opts.proxyLatency * 3, 30000) : 0;
+    const timeout = baseTimeout + proxyBuffer;
     const label = opts.label || url;
     const startMs = Date.now();
-    this.log(`[Nav] Navigating to ${label}...`);
+    this.log(`[Nav] Navigating to ${label} (timeout ${(timeout / 1000).toFixed(0)}s${proxyBuffer ? ` incl ${(proxyBuffer/1000).toFixed(0)}s proxy buffer` : ''})...`);
 
     try {
       // domcontentloaded fires when HTML is parsed — don't wait for all resources
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
     } catch (e) {
       const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
-      // If page actually navigated (URL changed), treat as partial success
+      const msg = e.message || '';
+      
+      // Detect proxy-specific errors
+      if (msg.includes('ERR_TIMED_OUT') || msg.includes('ERR_PROXY_CONNECTION_FAILED') || 
+          msg.includes('ERR_TUNNEL_CONNECTION_FAILED') || msg.includes('ERR_SOCKS_CONNECTION_FAILED')) {
+        this.log(`[Nav] ⚠️ Proxy/network error for ${label} after ${elapsed}s: ${msg.substring(0, 120)}`);
+        return false;
+      }
+      
+      // Check for chrome-error (dead proxy)
       const currentUrl = page.url();
-      if (currentUrl.includes(new URL(url).hostname) || currentUrl !== 'about:blank') {
+      if (currentUrl.includes('chrome-error')) {
+        this.log(`[Nav] ⚠️ Chrome error page for ${label} after ${elapsed}s — proxy is dead`);
+        return false;
+      }
+      
+      // If page actually navigated (URL changed), treat as partial success
+      if (currentUrl.includes(new URL(url).hostname) || (currentUrl !== 'about:blank' && !currentUrl.includes('chrome-error'))) {
         this.log(`[Nav] Partial load for ${label} (${elapsed}s) — page URL: ${currentUrl.substring(0, 80)}`);
       } else {
-        this.log(`[Nav] Failed to navigate to ${label} after ${elapsed}s: ${e.message.substring(0, 100)}`);
+        this.log(`[Nav] Failed to navigate to ${label} after ${elapsed}s: ${msg.substring(0, 100)}`);
         return false;
       }
     }
@@ -2031,7 +2053,7 @@ class PlaywrightEngine {
           triedSession = true;
 
           const page = await context.newPage();
-          await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify session)', timeout: 25000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify session)', timeout: 45000 });
           await this._waitForPageReady(page);
           await this._humanDelay(1000, 2000);
           isLoggedIn = await this._checkVKLogin(page);
@@ -2060,7 +2082,7 @@ class PlaywrightEngine {
           }
 
           const page = await context.newPage();
-          await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify cookies)', timeout: 25000 });
+          await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify cookies)', timeout: 45000 });
           await this._waitForPageReady(page);
           await this._humanDelay(1000, 2000);
           isLoggedIn = await this._checkVKLogin(page);
@@ -2127,7 +2149,7 @@ class PlaywrightEngine {
         }
         
         const page = await context.newPage();
-        await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify cookie account)', timeout: 25000 });
+        await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (verify cookie account)', timeout: 45000 });
         await this._waitForPageReady(page);
         await this._humanDelay(2000, 4000);
         isLoggedIn = await this._checkVKLogin(page);
@@ -2366,8 +2388,11 @@ class PlaywrightEngine {
           await searchInput.press('Enter');
           this.log(`[Search] Submitted search: "${keywords.substring(0, 50)}"`);
           
-          await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+          await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
           await this._humanDelay(3000, 5000);
+          // Extra wait for results to render on slow proxy connections
+          await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+          await this._humanDelay(1000, 2000);
 
           this.log(`[Search] Results page: ${page.url().substring(0, 80)}`);
 
@@ -2412,11 +2437,11 @@ class PlaywrightEngine {
                 return true;
               }
               
-              // Detect if no more content is loading
+              // Detect if no more content is loading (be patient on slow proxies)
               if (found.total === prevLinkCount) {
                 noNewLinksCount++;
-                if (noNewLinksCount >= 3) {
-                  this.log(`[Search] No new results after ${noNewLinksCount} scrolls. Stopping. (${found.total} links total)`);
+                if (noNewLinksCount >= 5) {
+                  this.log(`[Search] No new results after ${noNewLinksCount} consecutive scrolls. Stopping. (${found.total} links total)`);
                   break;
                 }
               } else {
@@ -2429,9 +2454,9 @@ class PlaywrightEngine {
                 this.log(`[Search] Scroll ${scrollsDone}/${maxScrolls || '\u221e'}: ${found.total} links scanned`);
               }
               
-              // Scroll down
+              // Scroll down (use longer wait for slow proxy connections)
               await page.mouse.wheel(0, this._randomDelay(400, 800));
-              await this._humanDelay(1000, 2500);
+              await this._humanDelay(2000, 4000);
               
               // Occasional scroll-up for natural behavior
               if (scrollsDone > 0 && scrollsDone % 7 === 0) {
@@ -2508,41 +2533,30 @@ class PlaywrightEngine {
     }
   }
 
-  async watchVideo(page, duration) {
-    const settings = this.store.get('settings') || {};
-    const watchMin = duration || settings.watchDuration?.min || 30;
-    const watchMax = duration || settings.watchDuration?.max || 120;
-    const watchTime = this._randomDelay(watchMin, watchMax);
-    
-    this.log(`[Watch] Target watch time: ${watchTime}s (range ${watchMin}-${watchMax}s)`);
-    
-    // Shadow DOM helper — VK uses <vk-video-player> Web Component
-    const FIND_VIDEOS_JS = `
-      function _findVideos(root) {
-        const found = [];
-        for (const el of root.querySelectorAll('*')) {
-          if (el.tagName === 'VIDEO') found.push(el);
-          if (el.shadowRoot) found.push(..._findVideos(el.shadowRoot));
-        }
-        return found;
-      }
-    `;
+  /**
+   * Watches a VK video until completion.
+   * 
+   * Strategy: detect ALL <video> elements (main video + ad), calculate total
+   * real-time needed = (mainDuration + adDuration) / playbackRate, then watch
+   * until the main video ends or the time runs out.
+   * 
+   * At 0.25x speed a 90s video takes 360s of real time to finish.
+   * With a 15s ad at 0.25x that's +60s = 420s total.
+   */
+  async watchVideo(page) {
+    this.log('[Watch] Starting full video watch...');
 
     try {
-      // ── Step 0: NOTE on duration ──
-      // data-testid="video_duration" in the UI may show the AD countdown (e.g., "00:10")
-      // NOT the actual video duration. We only trust video.duration from JS after playback.
-      // The UI value is logged but NOT used for calculation.
-      let uiDurationText = null;
+      // -- Step 0: Log UI duration (for reference only -- often shows ad timer) --
       try {
         const durSpan = page.getByTestId('video_duration');
         if (await durSpan.isVisible({ timeout: 2000 })) {
-          uiDurationText = await durSpan.textContent();
-          this.log(`[Watch] UI duration label: "${uiDurationText}" (may be ad timer, NOT used for calculation)`);
+          const uiDurationText = await durSpan.textContent();
+          this.log(`[Watch] UI duration label: "${uiDurationText}" (may be ad timer, informational only)`);
         }
       } catch (e) {}
 
-      // ── Step 1: Wait for video element (Playwright locator pierces Shadow DOM) ──
+      // -- Step 1: Wait for video element --
       this.log('[Watch] Looking for <video> element (with Shadow DOM piercing)...');
       let videoFound = false;
       try {
@@ -2551,7 +2565,6 @@ class PlaywrightEngine {
         videoFound = true;
         this.log('[Watch] <video> found via Playwright locator');
       } catch (e) {
-        // Manual shadow DOM traversal
         const jsCount = await page.evaluate(() => {
           function _fv(root) { const f=[]; for(const el of root.querySelectorAll('*')){ if(el.tagName==='VIDEO')f.push(el); if(el.shadowRoot)f.push(..._fv(el.shadowRoot)); } return f; }
           return _fv(document).length;
@@ -2564,7 +2577,7 @@ class PlaywrightEngine {
         }
       }
 
-      // ── Step 2: Click player area to start playback ──
+      // -- Step 2: Click player area to start playback --
       try {
         const playerArea = page.locator('vk-video-player, [class*="VideoPlayer__player"]').first();
         if (await playerArea.isVisible({ timeout: 3000 })) {
@@ -2574,7 +2587,7 @@ class PlaywrightEngine {
         }
       } catch (e) {}
 
-      // ── Step 3: Force play via JS (traverse shadow DOM) ──
+      // -- Step 3: Force play + gather info on all video elements --
       const playResult = await page.evaluate(() => {
         function _fv(root) { const f=[]; for(const el of root.querySelectorAll('*')){ if(el.tagName==='VIDEO')f.push(el); if(el.shadowRoot)f.push(..._fv(el.shadowRoot)); } return f; }
         const videos = _fv(document);
@@ -2587,10 +2600,10 @@ class PlaywrightEngine {
             duration: isFinite(video.duration) ? Math.round(video.duration) : -1,
             currentTime: Math.round(video.currentTime),
             readyState: video.readyState,
+            playbackRate: video.playbackRate,
             src: (video.src || video.currentSrc || '').substring(0, 60),
           });
         }
-        // Remove overlays
         document.querySelectorAll('[class*="overlay"],[class*="Overlay"],[class*="promo"]')
           .forEach(el => { if (el.style) el.style.display = 'none'; });
         return results;
@@ -2600,43 +2613,61 @@ class PlaywrightEngine {
         this.log(`[Watch] Found ${playResult.length} video element(s): ${JSON.stringify(playResult)}`);
       }
 
-      // Pick the video with the longest duration (the real video, not the ad)
-      let mainVideo = playResult[0];
-      if (playResult.length > 1) {
-        const longest = playResult.reduce((best, v) => (v.duration > (best?.duration || 0) ? v : best), null);
-        if (longest && longest.duration > (mainVideo?.duration || 0)) {
-          mainVideo = longest;
-          this.log(`[Watch] Selected longest video: ${mainVideo.duration}s (ad video was ${playResult.find(v => v !== longest)?.duration || '?'}s)`);
-        }
-      }
-      if (mainVideo) {
-        const durStr = mainVideo.duration > 0 ? `${mainVideo.duration}s` : 'unknown';
-        this.log(`[Watch] Main video: paused=${mainVideo.paused}, duration=${durStr}, readyState=${mainVideo.readyState}`);
+      // -- Step 4: Identify main video and ad --
+      let mainVideo = null;
+      let adVideo = null;
+      if (playResult.length >= 2) {
+        const sorted = [...playResult].sort((a, b) => b.duration - a.duration);
+        mainVideo = sorted[0];
+        adVideo = sorted[1];
+        this.log(`[Watch] Main video: ${mainVideo.duration}s, Ad: ${adVideo.duration}s`);
+      } else if (playResult.length === 1) {
+        mainVideo = playResult[0];
       }
 
-      // ── Step 4: Click play if still paused ──
+      const mainDuration = mainVideo && mainVideo.duration > 0 ? mainVideo.duration : 0;
+      const adDuration = adVideo && adVideo.duration > 0 ? adVideo.duration : 0;
+      const playbackRate = mainVideo?.playbackRate || 1;
+
+      // -- Step 5: Calculate total watch time --
+      // Real wall-clock time = (video_seconds + ad_seconds) / playbackRate
+      // Add 15s buffer for loading, transitions, buffering, and end-screen
+      let watchTime;
+      if (mainDuration > 0) {
+        watchTime = Math.ceil((mainDuration + adDuration) / playbackRate) + 15;
+        this.log(`[Watch] Calculated watch time: (${mainDuration}s video + ${adDuration}s ad) / ${playbackRate}x + 15s buffer = ${watchTime}s`);
+      } else {
+        // Duration unknown -- fall back to generous 10 minutes, will stop on video.ended
+        watchTime = 600;
+        this.log(`[Watch] Video duration unknown, using ${watchTime}s max (will stop on video.ended)`);
+      }
+
+      if (mainVideo) {
+        const durStr = mainDuration > 0 ? `${mainDuration}s` : 'unknown';
+        this.log(`[Watch] Main video: paused=${mainVideo.paused}, duration=${durStr}, rate=${playbackRate}x, readyState=${mainVideo.readyState}`);
+      }
+
+      // -- Step 6: Click play if still paused --
       if (!mainVideo || mainVideo.paused) {
         try {
-          const playBtn = page.getByRole('button', { name: /play|воспроизвести/i }).first();
+          const playBtn = page.getByRole('button', { name: /play|\u0432\u043e\u0441\u043f\u0440\u043e\u0438\u0437\u0432\u0435\u0441\u0442\u0438/i }).first();
           if (await playBtn.isVisible({ timeout: 2000 })) {
             await playBtn.click();
             this.log('[Watch] Clicked play via getByRole');
             await this._humanDelay(500, 1000);
           }
         } catch (e) {}
-        // Click player area again
         try {
           await page.locator('vk-video-player').first().click();
           this.log('[Watch] Clicked vk-video-player');
         } catch (e) {}
-        // Force play JS
         await page.evaluate(() => {
           function _fv(r){const f=[];for(const e of r.querySelectorAll('*')){if(e.tagName==='VIDEO')f.push(e);if(e.shadowRoot)f.push(..._fv(e.shadowRoot))}return f}
           _fv(document).forEach(v=>{v.muted=true;try{v.play()}catch(e){}});
         }).catch(() => {});
       }
 
-      // ── Step 5: Check playback state attribute ──
+      // -- Step 7: Check playback state --
       try {
         const pbState = await page.evaluate(() => {
           const el = document.querySelector('[data-playback-state]');
@@ -2645,10 +2676,11 @@ class PlaywrightEngine {
         if (pbState) this.log(`[Watch] data-playback-state: "${pbState}"`);
       } catch (e) {}
 
-      // ── Step 6: Watch loop ──
+      // -- Step 8: Watch loop -- wait until video ends or watchTime elapsed --
       const startTime = Date.now();
       let lastProgressCheck = 0;
-      let videoDuration = 'unknown';
+      let videoDuration = mainDuration > 0 ? `${mainDuration}s` : 'unknown';
+      let videoEnded = false;
       
       while ((Date.now() - startTime) / 1000 < watchTime) {
         if (page.isClosed()) {
@@ -2662,22 +2694,33 @@ class PlaywrightEngine {
           try {
             const status = await page.evaluate(() => {
               function _fv(r){const f=[];for(const e of r.querySelectorAll('*')){if(e.tagName==='VIDEO')f.push(e);if(e.shadowRoot)f.push(..._fv(e.shadowRoot))}return f}
-              const v = _fv(document)[0];
-              if (!v) return { found: false };
-              if (v.paused && !v.ended) { v.muted = true; try { v.play(); } catch (e) {} }
+              const videos = _fv(document);
+              if (videos.length === 0) return { found: false };
+              let main = videos[0];
+              for (const v of videos) {
+                if (isFinite(v.duration) && v.duration > (isFinite(main.duration) ? main.duration : 0)) main = v;
+              }
+              if (main.paused && !main.ended) { main.muted = true; try { main.play(); } catch (e) {} }
               return { 
-                found: true, paused: v.paused, ended: v.ended,
-                currentTime: Math.round(v.currentTime),
-                duration: isFinite(v.duration) ? Math.round(v.duration) : -1,
-                readyState: v.readyState, playbackRate: v.playbackRate,
-                buffered: v.buffered.length > 0 ? Math.round(v.buffered.end(v.buffered.length - 1)) : 0,
+                found: true, paused: main.paused, ended: main.ended,
+                currentTime: Math.round(main.currentTime),
+                duration: isFinite(main.duration) ? Math.round(main.duration) : -1,
+                readyState: main.readyState, playbackRate: main.playbackRate,
+                buffered: main.buffered.length > 0 ? Math.round(main.buffered.end(main.buffered.length - 1)) : 0,
+                videoCount: videos.length,
               };
             });
             if (status.found) {
               const durStr = status.duration > 0 ? `${status.duration}s` : videoDuration;
               if (status.duration > 0) videoDuration = `${status.duration}s`;
               const state = status.paused ? 'PAUSED' : status.ended ? 'ENDED' : 'PLAYING';
-              this.log(`[Watch] ${elapsed}s/${watchTime}s \u2014 video: ${status.currentTime}s/${durStr} [${state}] rate:${status.playbackRate} buf:${status.buffered}s`);
+              this.log(`[Watch] ${elapsed}s/${watchTime}s \u2014 video: ${status.currentTime}s/${durStr} [${state}] rate:${status.playbackRate}x buf:${status.buffered}s vids:${status.videoCount}`);
+              
+              if (status.ended) {
+                this.log('[Watch] \u2705 Main video ended');
+                videoEnded = true;
+                break;
+              }
             } else {
               const pbState = await page.evaluate(() => {
                 const el = document.querySelector('[data-playback-state]');
@@ -2696,7 +2739,7 @@ class PlaywrightEngine {
       }
       
       const totalWatched = Math.round((Date.now() - startTime) / 1000);
-      this.log(`[Watch] \u2705 Done \u2014 watched ${totalWatched}s (target ${watchTime}s), duration: ${videoDuration}`);
+      this.log(`[Watch] \u2705 Done \u2014 watched ${totalWatched}s (target ${watchTime}s), video: ${videoDuration}, ended: ${videoEnded}`);
       return true;
     } catch (error) {
       this.log(`[Watch] Error: ${error.message}`);
@@ -3170,12 +3213,8 @@ class PlaywrightEngine {
         await this._setPlaybackSpeed025(page);
       }
 
-      // Watch video
-      const watchDuration = this._randomDelay(
-        settings.watchDuration?.min || 30,
-        settings.watchDuration?.max || 120
-      );
-      const watched = await this.watchVideo(page, watchDuration);
+      // Watch video (full duration, auto-detected)
+      const watched = await this.watchVideo(page);
       result.viewed = watched;
 
       const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
@@ -3295,7 +3334,7 @@ class PlaywrightEngine {
             }
           }
             
-          const navOk = await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (session check)', timeout: 25000 });
+          const navOk = await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (session check)', timeout: 45000 });
           
           // Detect dead proxy: chrome-error:// or about:blank
           const currentUrl = page.url();
@@ -3392,12 +3431,8 @@ class PlaywrightEngine {
           await this._setPlaybackSpeed025(page);
         }
 
-        // ── Watch video ──
-        const watchDuration = this._randomDelay(
-          settings.watchDuration?.min || 30,
-          settings.watchDuration?.max || 120
-        );
-        await this.watchVideo(page, watchDuration);
+        // ── Watch video (full duration, auto-detected) ──
+        await this.watchVideo(page);
         result.viewed = true;
 
         // ── Like ──

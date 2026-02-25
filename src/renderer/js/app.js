@@ -921,8 +921,7 @@ async function loadSettings() {
   document.getElementById('ruCaptchaKey').value = settings.ruCaptchaKey || '';
   document.getElementById('typingDelayMin').value = settings.typingDelay?.min || 50;
   document.getElementById('typingDelayMax').value = settings.typingDelay?.max || 150;
-  document.getElementById('watchDurationMin').value = settings.watchDuration?.min || 30;
-  document.getElementById('watchDurationMax').value = settings.watchDuration?.max || 120;
+  // watchDuration min/max removed — video is now watched in full (auto-detected)
   document.getElementById('maxConcurrency').value = settings.maxConcurrency || 3;
   document.getElementById('headlessMode').checked = !!settings.headless;
 
@@ -950,10 +949,8 @@ document.getElementById('btnSaveSettings').addEventListener('click', async () =>
       min: parseInt(document.getElementById('typingDelayMin').value) || 50,
       max: parseInt(document.getElementById('typingDelayMax').value) || 150,
     },
-    watchDuration: {
-      min: parseInt(document.getElementById('watchDurationMin').value) || 30,
-      max: parseInt(document.getElementById('watchDurationMax').value) || 120,
-    },
+    // watchDuration min/max removed — video is watched in full (auto-detected)
+    watchDuration: { min: 0, max: 0 },
     maxConcurrency: parseInt(document.getElementById('maxConcurrency').value) || 3,
     headless: document.getElementById('headlessMode').checked,
     stealth: true,
