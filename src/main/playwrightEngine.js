@@ -268,8 +268,8 @@ class PlaywrightEngine {
       try {
         foundAltLogin = await page.evaluate(() => {
           const variants = [
-            'войти другим способом', 'другие способы входа', 'войти другим',
-            'other', 'другие', 'способ', 'log in another way', 'other login',
+            'войти другим способом', 'другие способы входа',
+            'log in another way', 'sign in another way',
           ];
           const elements = document.querySelectorAll('button, a, span, div[role="button"]');
           for (const el of elements) {
@@ -287,6 +287,8 @@ class PlaywrightEngine {
         });
         if (foundAltLogin) {
           this.log('[VK Login] Clicked "Войти другим способом"');
+          // Wait for page to settle after click — this prevents "drifting"
+          await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
           await this._humanDelay(2000, 3000);
         }
       } catch (e) {}
@@ -504,17 +506,15 @@ class PlaywrightEngine {
           this.log('[VK Login] Pressed Enter as fallback submit');
         }
 
+        await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
         await this._humanDelay(2500, 4000);
       }
 
       // ── Step 5a: Robot challenge after submit ──
       await this._handleRobotChallenge(page);
 
-      // ── Step 5b: "I'm not a robot" checkbox (Python ref: after phone input) ──
-      for (let i = 0; i < 3; i++) {
-        if (await this._clickNotRobotCheckbox(page)) break;
-        await this._humanDelay(800, 1200);
-      }
+      // ── Step 5b: "I'm not a robot" checkbox (only if captcha appears after submit) ──
+      await this._clickNotRobotCheckbox(page);
 
       // ── Step 6: Detect page state after login submit ──
       this.log('[VK Login] Step 6: Detecting page state...');
@@ -768,20 +768,18 @@ class PlaywrightEngine {
         this.log('[VK Login] Pressed Enter for password submit');
       }
 
+      await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
       await this._humanDelay(3000, 5000);
 
       // ── Step 10: Post-password checks (Python ref: captcha loop) ──
       this.log('[VK Login] Step 10: Post-password checks...');
 
-      // Robot challenge / "Продолжить" clicks (Python ref: 10 attempts)
-      for (let i = 0; i < 10; i++) {
+      // Robot challenge / "Продолжить" clicks (Python ref: reduced attempts)
+      for (let i = 0; i < 3; i++) {
         const hasRobot = await this._handleRobotChallenge(page);
         if (!hasRobot) break;
         await this._humanDelay(1500, 2500);
       }
-
-      // Dismiss any remaining popups
-      await this._dismissConfirmationPopup(page);
 
       // Try solve captcha if present (Python ref: max_captcha_attempts loop)
       const settings = this.store.get('settings') || {};
@@ -1054,30 +1052,43 @@ class PlaywrightEngine {
    * Returns true if a robot challenge was found and handled.
    */
   async _handleRobotChallenge(page) {
-    const maxAttempts = 5;
+    const maxAttempts = 3;
     
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // Python ref: is_robot_check_visible
-      const isRobot = await page.evaluate(() => {
+      // Check if we're actually on a robot challenge page (not just any page with "robot" word)
+      const robotInfo = await page.evaluate(() => {
+        const url = (window.location.href || '').toLowerCase();
         const body = (document.body?.innerText || '').toLowerCase();
-        return body.includes('робот') || body.includes('robot');
-      }).catch(() => false);
+        
+        // Must be on a challenge/captcha page, not just any page
+        const isChallengePage = url.includes('challenge') || url.includes('captcha') || url.includes('not_robot');
+        const hasRobotCheck = body.includes('проверяем, что вы не робот') || body.includes('checking that you are not a robot');
+        // Generic "robot" text check — but only if it's prominent (short context)
+        const bodyLines = body.split('\n').filter(l => l.trim());
+        const hasRobotLine = bodyLines.some(l => l.length < 100 && (l.includes('робот') || l.includes('robot')));
+        
+        return {
+          isRobot: isChallengePage || hasRobotCheck || hasRobotLine,
+          isChallengePage,
+          hasRobotCheck,
+        };
+      }).catch(() => ({ isRobot: false }));
 
-      if (!isRobot) return false;
+      if (!robotInfo.isRobot) return false;
 
       this.log(`[VK Login] Robot challenge detected (attempt ${attempt + 1}/${maxAttempts})`);
 
-      // Python ref: click_robot_check_continue — multiple strategies
       let clicked = false;
       
-      // 1. XPath-style: buttons with "Продолжить" / "Continue" (Python ref priority)
+      // 1. Click "Продолжить" / "Continue" ONLY on robot challenge pages
       try {
         clicked = await page.evaluate(() => {
-          // Buttons and role=button with Continue text
-          const xpathEls = document.querySelectorAll('button, *[role="button"]');
-          for (const el of xpathEls) {
-            const text = (el.textContent || '').toLowerCase();
-            if ((text.includes('продолжить') || text.includes('continue')) && el.offsetParent !== null) {
+          const btns = document.querySelectorAll('button, *[role="button"]');
+          for (const el of btns) {
+            const text = (el.textContent || '').toLowerCase().trim();
+            if (text.length > 30) continue;
+            if ((text.includes('продолжить') || text.includes('continue') || text.includes('начать') || text.includes('start')) 
+                && el.offsetParent !== null && !el.disabled) {
               el.scrollIntoView();
               el.click();
               return true;
@@ -1087,14 +1098,9 @@ class PlaywrightEngine {
         });
       } catch (e) {}
 
-      // 2. Python ref: CSS selectors (body > div > button.start, button.start, button[type=submit])
+      // 2. CSS selectors for robot challenge buttons
       if (!clicked) {
-        const cssSelectors = [
-          'body > div > button.start',
-          'button.start',
-          'button[type="submit"]',
-          'div button.start',
-        ];
+        const cssSelectors = ['body > div > button.start', 'button.start', 'button[type="submit"]'];
         for (const sel of cssSelectors) {
           try {
             const btn = page.locator(sel).first();
@@ -1107,52 +1113,28 @@ class PlaywrightEngine {
         }
       }
 
-      // 3. Python ref: any clickable element with "Продолжить"/"Continue"
-      if (!clicked) {
-        try {
-          clicked = await page.evaluate(() => {
-            const els = document.querySelectorAll('button, a, span, div');
-            for (const el of els) {
-              const text = (el.textContent || '').toLowerCase();
-              if ((text.includes('продолжить') || text.includes('continue')) && 
-                  el.offsetParent !== null && 
-                  ['button', 'a', 'span', 'div'].includes(el.tagName.toLowerCase())) {
-                el.scrollIntoView();
-                el.click();
-                return true;
-              }
-            }
-            return false;
-          });
-        } catch (e) {}
-      }
-
-      // 4. Python ref: Turnstile iframes
+      // 3. Turnstile iframes
       if (!clicked) {
         try {
           const frames = page.frames();
           for (const frame of frames) {
+            const frameUrl = frame.url().toLowerCase();
+            if (!frameUrl.includes('turnstile') && !frameUrl.includes('challenge') && !frameUrl.includes('captcha')) continue;
             try {
               const clickedInFrame = await frame.evaluate(() => {
                 const els = document.querySelectorAll('button, *[role="button"], input[type="submit"]');
                 for (const el of els) {
-                  if (el.offsetParent !== null) {
-                    el.click();
-                    return true;
-                  }
+                  if (el.offsetParent !== null) { el.click(); return true; }
                 }
                 return false;
               });
-              if (clickedInFrame) {
-                clicked = true;
-                break;
-              }
+              if (clickedInFrame) { clicked = true; break; }
             } catch (e) {}
           }
         } catch (e) {}
       }
 
-      // 5. Try ruCaptcha to solve the challenge
+      // 4. Try captcha solver
       if (!clicked) {
         await this._trySolveCaptchaOnPage(page);
       }
@@ -1164,42 +1146,77 @@ class PlaywrightEngine {
   }
 
   /**
-   * Clicks "I'm not a robot" / "Я не робот" checkbox
+   * Clicks "I'm not a robot" / "Я не робот" checkbox.
+   * IMPORTANT: Must NOT click unrelated checkboxes like "Save login" / "Запомнить".
    */
   async _clickNotRobotCheckbox(page) {
     try {
-      // Check for visible checkbox
+      // Only click checkboxes that are inside captcha/challenge containers
+      // or have robot/captcha-related context
       const clicked = await page.evaluate(() => {
-        // Direct checkbox
-        const checkboxes = document.querySelectorAll('input[type="checkbox"], [role="checkbox"], .checkbox');
-        for (const cb of checkboxes) {
-          if (cb.offsetParent !== null) {
+        // Exclusion keywords — DO NOT click these
+        const excludeTexts = [
+          'запомн', 'сохран', 'remember', 'save', 'keep', 'stay',
+          'не выходить', 'оставаться', 'не закрыв',
+        ];
+        
+        // 1. Look for elements specifically about "not a robot"
+        const robotTexts = ['not a robot', 'не робот', 'i\'m not a robot', 'я не робот'];
+        const allElements = document.querySelectorAll('label, span, div, p');
+        for (const el of allElements) {
+          const text = (el.textContent || '').toLowerCase().trim();
+          if (text.length > 80 || text.length === 0) continue;
+          if (el.offsetParent === null) continue;
+          
+          // Must contain robot-related text
+          if (!robotTexts.some(rt => text.includes(rt))) continue;
+          // Must NOT contain exclusion text
+          if (excludeTexts.some(et => text.includes(et))) continue;
+          
+          // Try to find and click associated checkbox
+          const checkbox = el.querySelector('input[type="checkbox"], [role="checkbox"]')
+            || el.closest('label')?.querySelector('input[type="checkbox"]');
+          if (checkbox) {
+            checkbox.click();
+            return true;
+          }
+          // Click the element itself (it might be the checkbox wrapper)
+          el.click();
+          return true;
+        }
+        
+        // 2. Look for checkboxes inside captcha/challenge containers
+        const captchaContainers = document.querySelectorAll(
+          '[class*="captcha"], [class*="challenge"], [class*="robot"], [id*="captcha"], [id*="challenge"]'
+        );
+        for (const container of captchaContainers) {
+          const cb = container.querySelector('input[type="checkbox"], [role="checkbox"]');
+          if (cb && cb.offsetParent !== null) {
             cb.click();
             return true;
           }
         }
-        // Text-based
-        const elements = document.querySelectorAll('*');
-        for (const el of elements) {
-          const text = (el.textContent || '').toLowerCase();
-          if ((text.includes('not a robot') || text.includes('не робот')) && text.length < 50 && el.offsetParent !== null) {
-            el.click();
-            return true;
-          }
-        }
+        
         return false;
       }).catch(() => false);
 
       if (clicked) {
         this.log('[VK Login] Clicked not-a-robot checkbox');
         await this._humanDelay(1500, 2500);
+        return true;
       }
 
-      // Try iframes (recaptcha)
+      // Try iframes (recaptcha / turnstile)
       const frames = page.frames();
       for (const frame of frames) {
         try {
-          const cb = frame.locator('[role="checkbox"], .rc-anchor-checkbox, input[type="checkbox"]').first();
+          const frameUrl = frame.url().toLowerCase();
+          // Only check captcha-related iframes
+          if (!frameUrl.includes('captcha') && !frameUrl.includes('recaptcha') && 
+              !frameUrl.includes('challenge') && !frameUrl.includes('turnstile') &&
+              !frameUrl.includes('hcaptcha') && !frameUrl.includes('anchor')) continue;
+          
+          const cb = frame.locator('[role="checkbox"], .rc-anchor-checkbox, .recaptcha-checkbox').first();
           if (await cb.isVisible({ timeout: 1000 })) {
             await cb.click();
             this.log('[VK Login] Clicked not-a-robot checkbox in iframe');
@@ -2325,12 +2342,13 @@ class PlaywrightEngine {
           // Stagger start
           await this._humanDelay(idx * 1000, idx * 2000 + 1000);
           
+          let opResult = null;
           try {
-            const result = await this._executeSingleOp(op, task, settings);
-            if (result.viewed) results.views++;
-            if (result.liked) results.likes++;
-            if (result.commented) results.comments++;
-            if (result.error) results.errors++;
+            opResult = await this._executeSingleOp(op, task, settings);
+            if (opResult.viewed) results.views++;
+            if (opResult.liked) results.likes++;
+            if (opResult.commented) results.comments++;
+            if (opResult.error) results.errors++;
           } catch (e) {
             results.errors++;
             this.log(`[Task] Op error: ${e.message}`);
@@ -2340,7 +2358,7 @@ class PlaywrightEngine {
             onProgress({
               current: batchStart + idx + 1,
               total: ops.length,
-              status: result?.error ? 'error' : 'ok',
+              status: opResult?.error ? 'error' : 'ok',
               message: `Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Errors: ${results.errors}`,
             });
           }
