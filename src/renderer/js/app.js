@@ -715,6 +715,7 @@ function renderTasks() {
         <span><i class="fas fa-clock"></i> ${formatDate(t.createdAt)}</span>
         ${t.useSearch ? `<span><i class="fas fa-search"></i> "${escapeHtml(t.searchKeywords || '')}"</span>` : ''}
         ${t.slowSpeed ? `<span><i class="fas fa-gauge-simple"></i> 0.25x</span>` : ''}
+        ${t.ghostWatchers ? `<span><i class="fas fa-ghost"></i> Ghost</span>` : ''}
       </div>
       <div class="task-progress"><div class="task-progress-bar" style="width:${pct}%"></div></div>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">${pct}% — ${t.completedItems || 0}/${t.totalItems || t.viewCount} ops (${t.successItems || 0} ok, ${t.errorItems || 0} err)</div>
@@ -778,6 +779,10 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
     <div class="form-group" id="taskSearchGroup" style="display:none">
       <label>Search Keywords</label>
       <input type="text" id="taskSearchKeywords" placeholder="e.g. funny video 2025" style="width:100%">
+      <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
+        <label style="font-size:11px;white-space:nowrap">Max scrolls (0 = scroll until found):</label>
+        <input type="number" id="taskSearchScrolls" value="0" min="0" max="200" style="width:70px;font-size:12px">
+      </div>
     </div>
     <div class="form-group">
       <label>Comment Folder (optional)</label>
@@ -790,7 +795,10 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
       <label><input type="checkbox" id="taskAllowDirect"><span>Allow direct connection (no proxy)</span></label>
     </div>
     <div class="form-group checkbox-group">
-      <label><input type="checkbox" id="taskSlowSpeed"><span>Slow playback speed (0.25x) — longer watch, more retention</span></label>
+      <label><input type="checkbox" id="taskSlowSpeed"><span>Slow playback speed (0.25x) \u2014 longer watch, more retention</span></label>
+    </div>
+    <div class="form-group checkbox-group">
+      <label><input type="checkbox" id="taskGhostWatchers"><span>\ud83d\udc7b Ghost Watchers \u2014 use unused proxies to view video anonymously (no login, no like/comment, vkvideo.ru only)</span></label>
     </div>
     <div class="form-group">
       <label>Accounts</label>
@@ -824,6 +832,21 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
   document.getElementById('taskProxySelectAll').addEventListener('change', (e) => {
     document.querySelectorAll('.task-proxy-cb').forEach(cb => cb.checked = e.target.checked);
   });
+  // Uncheck "Select All" if any individual checkbox is unchecked
+  document.querySelectorAll('.task-acc-cb').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const all = document.querySelectorAll('.task-acc-cb');
+      const checked = document.querySelectorAll('.task-acc-cb:checked');
+      document.getElementById('taskAccSelectAll').checked = (all.length === checked.length);
+    });
+  });
+  document.querySelectorAll('.task-proxy-cb').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const all = document.querySelectorAll('.task-proxy-cb');
+      const checked = document.querySelectorAll('.task-proxy-cb:checked');
+      document.getElementById('taskProxySelectAll').checked = (all.length === checked.length);
+    });
+  });
 
   // Create
   document.getElementById('btnDoCreateTask').addEventListener('click', async () => {
@@ -833,21 +856,26 @@ document.getElementById('btnCreateTask').addEventListener('click', async () => {
     const commentCount = parseInt(document.getElementById('taskComments').value) || 0;
     const useSearch = document.getElementById('taskUseSearch').checked;
     const searchKeywords = document.getElementById('taskSearchKeywords').value.trim();
+    const searchScrollCount = parseInt(document.getElementById('taskSearchScrolls')?.value) || 0;
     const commentFolderId = document.getElementById('taskCommentFolder').value || null;
     const allowDirect = document.getElementById('taskAllowDirect').checked;
     const slowSpeed = document.getElementById('taskSlowSpeed').checked;
+    const ghostWatchers = document.getElementById('taskGhostWatchers').checked;
     const accountIds = [...document.querySelectorAll('.task-acc-cb:checked')].map(cb => cb.value);
     const proxyIds = [...document.querySelectorAll('.task-proxy-cb:checked')].map(cb => cb.value);
 
     if (!videoUrl) { showToast('Video URL required', 'warning'); return; }
     if (!accountIds.length) { showToast('Select at least 1 account', 'warning'); return; }
     if (useSearch && !searchKeywords) { showToast('Search keywords required when search is enabled', 'warning'); return; }
+    if (accountIds.length > viewCount) {
+      showToast(`Note: ${accountIds.length} accounts selected but only ${viewCount} views requested. Only ${viewCount} will be used.`, 'info');
+    }
 
     try {
       await window.api.task.create({
         videoUrl, viewCount, likeCount, commentCount,
-        useSearch, searchKeywords, commentFolderId,
-        allowDirect, slowSpeed, accountIds, proxyIds,
+        useSearch, searchKeywords, searchScrollCount, commentFolderId,
+        allowDirect, slowSpeed, ghostWatchers, accountIds, proxyIds,
       });
       showToast('Task created', 'success');
       closeModal();

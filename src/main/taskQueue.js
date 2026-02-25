@@ -31,6 +31,7 @@ class TaskQueue extends EventEmitter {
       videoTitle: task.videoTitle || null,
       searchKeywords: task.searchKeywords || '',
       useSearch: !!task.useSearch,
+      searchScrollCount: task.searchScrollCount || 0,
       viewCount,
       likeCount,
       commentCount,
@@ -38,6 +39,7 @@ class TaskQueue extends EventEmitter {
       proxyIds: task.proxyIds || [],
       allowDirect: !!task.allowDirect,
       slowSpeed: !!task.slowSpeed,
+      ghostWatchers: !!task.ghostWatchers,
       commentFolderId: task.commentFolderId || null,
       type: 'engagement',
       status: 'pending',
@@ -95,21 +97,21 @@ class TaskQueue extends EventEmitter {
       const results = await this.engine.executeEngagementTask(task, onProgress, signal);
       const status = signal.aborted ? 'stopped' : 'completed';
 
-      // results is { views, likes, comments, errors } — not an array
-      const successCount = (results.views || 0) + (results.likes || 0) + (results.comments || 0);
+      // results is { views, likes, comments, errors, ghostViews } — not an array
+      const successCount = (results.views || 0) + (results.likes || 0) + (results.comments || 0) + (results.ghostViews || 0);
       const errorCount = results.errors || 0;
 
       this.updateTask(id, {
         status, results,
         completedAt: new Date().toISOString(),
         progress: signal.aborted ? undefined : 100,
-        completedItems: (results.views || 0),
+        completedItems: (results.views || 0) + (results.ghostViews || 0),
         successItems: successCount,
         errorItems: errorCount,
       });
       this.emit('taskLog', {
         level: status === 'completed' ? 'success' : 'warn',
-        message: `Task ${id.substring(0, 8)}: ${status} (views: ${results.views || 0}, likes: ${results.likes || 0}, comments: ${results.comments || 0}, errors: ${errorCount})`,
+        message: `Task ${id.substring(0, 8)}: ${status} (views: ${results.views || 0}, likes: ${results.likes || 0}, comments: ${results.comments || 0}, ghost: ${results.ghostViews || 0}, errors: ${errorCount})`,
       });
     } catch (e) {
       this.updateTask(id, { status: 'error', completedAt: new Date().toISOString(), results: { error: e.message } });

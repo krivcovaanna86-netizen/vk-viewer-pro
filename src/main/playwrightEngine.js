@@ -1360,55 +1360,151 @@ class PlaywrightEngine {
   async _checkVKLogin(page) {
     try {
       const url = page.url().toLowerCase();
+      this.log(`[LoginCheck] URL: ${url.substring(0, 100)}`);
+      
+      // Negative: proxy error or blank page — not a VK response at all
+      if (url.includes('chrome-error') || url === 'about:blank') {
+        this.log('[LoginCheck] Negative: proxy/network error page');
+        return false;
+      }
+      
+      // Negative: obvious non-logged-in pages
+      if ((url.includes('login') || url.includes('/auth')) && url.includes('id.vk.com')) {
+        this.log('[LoginCheck] Negative: on VK login/auth page');
+        return false;
+      }
       
       // Positive URL checks
-      const loggedInUrls = ['/feed', '/im', '/friends', '/groups', '/music', '/video', '/clips', '/market'];
-      if (loggedInUrls.some(u => url.includes(u))) {
-        // Double check with DOM — VK may redirect to login even with /feed URL
+      const loggedInUrls = ['/feed', '/im', '/friends', '/groups', '/music', '/video', '/clips', '/market', '/discover'];
+      const urlMatch = loggedInUrls.some(u => url.includes(u));
+      
+      // User profile page (vk.com/id12345)
+      const isProfileUrl = /vk\.com\/id\d+/.test(url);
+      
+      // Extended DOM selectors — cover modern VK SPA, old VK, and vkvideo.ru
+      const DOM_SELECTORS = [
+        // Modern VK SPA (vkui-based)
+        '[data-testid="header-profile-menu-button"]',
+        '[data-testid="topnav_profile"]',
+        // Avatar images (multiple classes used)
+        'img[alt][class*="vkuiAvatar"]',
+        'img[alt][class*="vkuiImageBase__img"]',
+        'img.TopHomeLink__profileImg',
+        // Navigation elements only visible when logged in
+        'a[href*="/im"]',
+        'a[href*="/friends"]',
+        '[class*="TopNavBtn"]',
+        '.TopNavLink',
+        '#top_profile_link',
+        '[class*="TopProfileLink"]',
+        'header img[class*="Avatar"]',
+        // Old VK selectors
+        '#l_pr', '#l_msg', '#l_fr',
+        // VKVideo (vkvideo.ru) specific
+        '[class*="HeaderProfileButton"]',
+        '[class*="header__profile"]',
+        '[class*="UserBlock"]',
+        // Generic logged-in indicators
+        'a[href*="/settings"]',
+        '[data-testid="header_left_messenger"]',
+      ];
+
+      // Check DOM for profile indicators
+      let domLoggedIn = false;
+      let domSelector = null;
+      try {
+        // First try Playwright's getByTestId which pierces shadow DOM
+        for (const testId of ['header-profile-menu-button', 'topnav_profile']) {
+          try {
+            const el = page.getByTestId(testId);
+            if (await el.isVisible({ timeout: 2000 })) {
+              domLoggedIn = true;
+              domSelector = `getByTestId("${testId}")`;
+              break;
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+
+      // Then try page.evaluate for regular DOM selectors
+      if (!domLoggedIn) {
         try {
-          // Primary: data-testid from codegen recording
-          const profileBtn = page.getByTestId('header-profile-menu-button');
-          if (await profileBtn.isVisible({ timeout: 2000 })) return true;
+          domSelector = await page.evaluate((sels) => {
+            for (const sel of sels) {
+              const el = document.querySelector(sel);
+              if (el) return sel;
+            }
+            // Also check: does the page have any cookie-dependent content?
+            // If body text contains user-specific items
+            const bodyText = (document.body?.innerText || '').substring(0, 2000);
+            if (bodyText.includes('Моя страница') || bodyText.includes('Мои друзья') || bodyText.includes('Сообщения')) {
+              return 'body-text-indicator';
+            }
+            return null;
+          }, DOM_SELECTORS).catch(() => null);
+          if (domSelector) domLoggedIn = true;
         } catch (e) {}
-        
-        // Still trust URL-based check as fallback
+      }
+
+      if (domLoggedIn) {
+        this.log(`[LoginCheck] \u2705 Logged in (DOM: ${domSelector})`);
         return true;
       }
       
-      // User profile page (vk.com/id123...)
-      if (/vk\.com\/id\d+/.test(url)) return true;
-      
-      // Main page when logged in — check for logged-in DOM indicators
-      if ((url === 'https://vk.com/' || url === 'https://vk.com') && !url.includes('login') && !url.includes('auth')) {
-        // Primary: header profile button
-        try {
-          const profileBtn = page.getByTestId('header-profile-menu-button');
-          if (await profileBtn.isVisible({ timeout: 2000 })) return true;
-        } catch (e) {}
-        
-        // Fallback: other logged-in indicators
-        const isLoggedIn = await page.evaluate(() => {
-          const selectors = [
-            '[data-testid="header-profile-menu-button"]',
-            'a[href*="/im"]',
-            '[class*="TopNavBtn"]',
-            'a[href*="/friends"]',
-            '#l_pr',
-            '#l_msg',
-            '.TopNavLink',
-            '#top_profile_link',
-          ];
-          for (const sel of selectors) {
-            if (document.querySelector(sel)) return true;
-          }
-          return false;
-        }).catch(() => false);
-        
-        return isLoggedIn;
+      if (isProfileUrl) {
+        this.log('[LoginCheck] \u2705 On profile page');
+        return true;
       }
       
+      if (urlMatch) {
+        // URL says feed/friends/etc but DOM doesn't have profile elements yet
+        // Could be still loading — wait and retry with increasing timeouts
+        this.log('[LoginCheck] URL matches logged-in page, DOM not ready. Waiting 4s...');
+        await this._humanDelay(3000, 4000);
+        
+        // Retry with getByTestId first (pierces shadow DOM)
+        try {
+          const profileBtn = page.getByTestId('header-profile-menu-button');
+          if (await profileBtn.isVisible({ timeout: 3000 })) {
+            this.log(`[LoginCheck] \u2705 Logged in after retry (getByTestId)`);
+            return true;
+          }
+        } catch (e) {}
+        
+        // Retry with DOM selectors
+        try {
+          const retry = await page.evaluate((sels) => {
+            for (const sel of sels) {
+              if (document.querySelector(sel)) return sel;
+            }
+            return null;
+          }, DOM_SELECTORS).catch(() => null);
+          if (retry) {
+            this.log(`[LoginCheck] \u2705 Logged in after retry (DOM: ${retry})`);
+            return true;
+          }
+        } catch (e) {}
+        
+        // Final fallback: trust URL if it's /feed and not a redirect to login
+        if (url.includes('/feed') && !url.includes('login') && !url.includes('auth')) {
+          // Check that the page actually has meaningful content (not an empty shell)
+          const hasContent = await page.evaluate(() => {
+            return (document.body?.innerText || '').trim().length > 100;
+          }).catch(() => false);
+          if (hasContent) {
+            this.log('[LoginCheck] \u2705 Trusting URL-based check (/feed with content)');
+            return true;
+          }
+        }
+      }
+      
+      // Log extra diagnostics for debugging
+      const pageTitle = await page.title().catch(() => '?');
+      const bodyLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+      this.log(`[LoginCheck] \u274c Not logged in (URL match: ${urlMatch}, profile: ${isProfileUrl}, title: "${pageTitle.substring(0, 40)}", bodyLen: ${bodyLen})`);
       return false;
     } catch (e) {
+      this.log(`[LoginCheck] Error: ${e.message}`);
       return false;
     }
   }
@@ -2206,8 +2302,8 @@ class PlaywrightEngine {
   // VIDEO SEARCH & ENGAGEMENT
   // ============================================================
 
-  async searchAndFindVideo(page, keywords, targetUrl) {
-    this.log(`[Search] Searching for video: keywords="${keywords || 'none'}", target=${targetUrl || 'none'}`);
+  async searchAndFindVideo(page, keywords, targetUrl, maxScrolls = 0) {
+    this.log(`[Search] Searching for video: keywords="${keywords || 'none'}", target=${targetUrl || 'none'}, maxScrolls=${maxScrolls || 'unlimited'}`);
     
     // Extract video ID from target URL for matching (e.g., "video-224119603_456311034")
     let targetVideoId = null;
@@ -2219,12 +2315,9 @@ class PlaywrightEngine {
     
     try {
       // ── Navigate to VKVideo (vkvideo.ru is the current VK video domain) ──
-      // NOTE: vk.com/video often hangs on 'load' due to analytics resources.
-      // vkvideo.ru is the actual video search page now.
       const searchUrl = 'https://vkvideo.ru';
       const navOk = await this._safeGoto(page, searchUrl, { label: 'VKVideo search page', timeout: 30000 });
       if (!navOk) {
-        // Fallback: try vk.com/video
         this.log('[Search] vkvideo.ru failed, trying vk.com/video...');
         await this._safeGoto(page, 'https://vk.com/video', { label: 'VK Video fallback', timeout: 30000 });
       }
@@ -2248,7 +2341,7 @@ class PlaywrightEngine {
         if (!searchInput) {
           const searchSelectors = [
             'input[type="search"]',
-            'input[placeholder*="Поиск"]',
+            'input[placeholder*="\u041f\u043e\u0438\u0441\u043a"]',
             'input[placeholder*="Search"]',
             'input[name="q"]',
             'input[class*="search"]',
@@ -2273,68 +2366,113 @@ class PlaywrightEngine {
           await searchInput.press('Enter');
           this.log(`[Search] Submitted search: "${keywords.substring(0, 50)}"`);
           
-          // Wait for results — use domcontentloaded, never load
           await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
           await this._humanDelay(3000, 5000);
 
           this.log(`[Search] Results page: ${page.url().substring(0, 80)}`);
 
-          // Scroll through results to load more (VKVideo lazy-loads)
-          for (let scroll = 0; scroll < 8; scroll++) {
-            await page.mouse.wheel(0, this._randomDelay(400, 800));
-            await this._humanDelay(1000, 2000);
-          }
-          // Scroll back up a bit
-          await page.mouse.wheel(0, -300);
-          await this._humanDelay(500, 1000);
-
-          // Look for the target video in results
+          // ── Scroll-and-search loop ──
+          // maxScrolls=0 means infinite scrolling until found or no more results
+          const scrollLimit = maxScrolls > 0 ? maxScrolls : 200; // safety cap at 200
+          let scrollsDone = 0;
+          let prevLinkCount = 0;
+          let noNewLinksCount = 0;
+          
           if (targetVideoId) {
-            // Extract the numeric part for broader matching: "-224119603_456311034"
             const idParts = targetVideoId.match(/(-?\d+_\d+)/);
             const numericId = idParts ? idParts[1] : targetVideoId;
-            this.log(`[Search] Scanning results for: "${targetVideoId}" (numeric: "${numericId}")`);
+            this.log(`[Search] Will scroll and scan for: "${targetVideoId}" (numeric: "${numericId}")`);
             
-            const found = await page.evaluate(({ videoId, numId }) => {
-              // Collect ALL links broadly
+            for (scrollsDone = 0; scrollsDone < scrollLimit; scrollsDone++) {
+              // Check for video in current results
+              const found = await page.evaluate(({ videoId, numId }) => {
+                const links = document.querySelectorAll('a[href]');
+                const videoLinks = [];
+                for (const link of links) {
+                  const href = link.href || link.getAttribute('href') || '';
+                  if (href.includes('video') || href.includes(numId)) {
+                    videoLinks.push({ el: link, href });
+                  }
+                }
+                for (const { el, href } of videoLinks) {
+                  if (href.includes(videoId) || href.includes(numId)) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    el.click();
+                    return { found: true, href, total: videoLinks.length, method: 'exact' };
+                  }
+                }
+                return { found: false, total: videoLinks.length, sample: videoLinks.slice(0, 5).map(v => v.href.substring(0, 80)) };
+              }, { videoId: targetVideoId, numId: numericId });
+
+              if (found.found) {
+                this.log(`[Search] \u2705 Found target video after ${scrollsDone} scrolls (${found.total} links): ${found.href}`);
+                await this._humanDelay(2000, 3000);
+                return true;
+              }
+              
+              // Detect if no more content is loading
+              if (found.total === prevLinkCount) {
+                noNewLinksCount++;
+                if (noNewLinksCount >= 3) {
+                  this.log(`[Search] No new results after ${noNewLinksCount} scrolls. Stopping. (${found.total} links total)`);
+                  break;
+                }
+              } else {
+                noNewLinksCount = 0;
+              }
+              prevLinkCount = found.total;
+              
+              // Log progress every 5 scrolls
+              if (scrollsDone % 5 === 0 && scrollsDone > 0) {
+                this.log(`[Search] Scroll ${scrollsDone}/${maxScrolls || '\u221e'}: ${found.total} links scanned`);
+              }
+              
+              // Scroll down
+              await page.mouse.wheel(0, this._randomDelay(400, 800));
+              await this._humanDelay(1000, 2500);
+              
+              // Occasional scroll-up for natural behavior
+              if (scrollsDone > 0 && scrollsDone % 7 === 0) {
+                await page.mouse.wheel(0, -200);
+                await this._humanDelay(500, 1000);
+              }
+            }
+            
+            // Final check with all loaded content
+            const finalCheck = await page.evaluate(({ videoId, numId }) => {
               const links = document.querySelectorAll('a[href]');
-              const videoLinks = [];
+              let total = 0;
               for (const link of links) {
                 const href = link.href || link.getAttribute('href') || '';
-                // Check if this is a video link
                 if (href.includes('video') || href.includes(numId)) {
-                  videoLinks.push({ el: link, href });
+                  total++;
+                  if (href.includes(videoId) || href.includes(numId)) {
+                    link.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    link.click();
+                    return { found: true, href, total };
+                  }
                 }
               }
-              
-              // First pass: exact video ID match
-              for (const { el, href } of videoLinks) {
-                if (href.includes(videoId) || href.includes(numId)) {
-                  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                  el.click();
-                  return { found: true, href, total: videoLinks.length, method: 'exact' };
-                }
-              }
-              
-              // Return sample for debugging
-              return { 
-                found: false, 
-                total: videoLinks.length, 
-                sample: videoLinks.slice(0, 10).map(v => v.href.substring(0, 100)),
-              };
+              return { found: false, total, sample: [...links].filter(l => (l.href||'').includes('video')).slice(0, 10).map(l => l.href.substring(0, 80)) };
             }, { videoId: targetVideoId, numId: numericId });
-
-            if (found.found) {
-              this.log(`[Search] ✅ Found target video (${found.method}) in results (${found.total} links): ${found.href}`);
+            
+            if (finalCheck.found) {
+              this.log(`[Search] \u2705 Found target video in final scan (${finalCheck.total} links): ${finalCheck.href}`);
               await this._humanDelay(2000, 3000);
               return true;
             }
             
-            this.log(`[Search] Target video not in results (${found.total} video links). Sample hrefs:`);
-            (found.sample || []).forEach((h, i) => this.log(`[Search]   ${i}: ${h}`));
+            this.log(`[Search] Target video not found after ${scrollsDone} scrolls (${finalCheck.total} links). Sample hrefs:`);
+            (finalCheck.sample || []).forEach((h, i) => this.log(`[Search]   ${i}: ${h}`));
+          } else {
+            // No target ID to match, just scroll a few times
+            for (let s = 0; s < 8; s++) {
+              await page.mouse.wheel(0, this._randomDelay(400, 800));
+              await this._humanDelay(1000, 2000);
+            }
           }
         } else {
-          this.log('[Search] ⚠️ Search input not found on page');
+          this.log('[Search] \u26a0\ufe0f Search input not found on page');
         }
       }
       
@@ -2348,7 +2486,6 @@ class PlaywrightEngine {
           this.log(`[Search] Direct navigation OK, current URL: ${page.url().substring(0, 80)}`);
           return true;
         }
-        // Even if _safeGoto returned false, page might have partially loaded
         this.log(`[Search] Direct navigation partial, current URL: ${page.url().substring(0, 80)}`);
         return page.url() !== 'about:blank';
       }
@@ -2802,9 +2939,11 @@ class PlaywrightEngine {
       commentCount = 0,
       searchKeywords,
       useSearch = false,
+      searchScrollCount = 0,
       accountIds = [],
       proxyIds = [],
       slowSpeed = false,
+      ghostWatchers = false,
     } = task;
 
     if (!videoUrl) {
@@ -2813,8 +2952,8 @@ class PlaywrightEngine {
 
     this.log(`[Task] Starting engagement task for: ${videoUrl}`);
     this.log(`[Task] Views: ${viewCount}, Likes: ${likeCount}, Comments: ${commentCount}`);
-    this.log(`[Task] Mode: ${useSearch ? 'search' : 'direct'}, Accounts: ${accountIds.length}, Proxies: ${proxyIds.length}`);
-    this.log(`[Task] Slow speed (0.25x): ${slowSpeed ? 'YES' : 'no'}`);
+    this.log(`[Task] Mode: ${useSearch ? 'search' : 'direct'}${useSearch ? ` (scrolls: ${searchScrollCount || 'unlimited'})` : ''}, Accounts: ${accountIds.length}, Proxies: ${proxyIds.length}`);
+    this.log(`[Task] Slow speed (0.25x): ${slowSpeed ? 'YES' : 'no'}, Ghost Watchers: ${ghostWatchers ? 'YES' : 'no'}`);
 
     const accounts = this.store.get('accounts') || [];
     const comments = this.store.get('comments') || [];
@@ -2822,6 +2961,7 @@ class PlaywrightEngine {
 
     // Build operation plan
     const ops = [];
+    const usedProxyIds = new Set();
     
     for (let i = 0; i < Math.max(viewCount, likeCount, commentCount); i++) {
       const accountId = accountIds[i % accountIds.length];
@@ -2832,11 +2972,13 @@ class PlaywrightEngine {
       let proxyId = null;
       if (proxyIds.length > 0) {
         proxyId = proxyIds[i % proxyIds.length];
+        usedProxyIds.add(proxyId);
       } else if (account.proxyId) {
         proxyId = account.proxyId;
       }
 
       ops.push({
+        type: 'engagement',
         accountId,
         proxyId,
         shouldLike: i < likeCount,
@@ -2848,28 +2990,50 @@ class PlaywrightEngine {
       });
     }
 
-    this.log(`[Task] Total operations: ${ops.length}, Concurrency: ${maxConcurrency}`);
+    // Ghost Watchers: use unused proxies to anonymously view the video
+    const ghostOps = [];
+    if (ghostWatchers && proxyIds.length > 0) {
+      const unusedProxyIds = proxyIds.filter(pid => !usedProxyIds.has(pid));
+      // Also add all proxies as additional ghost watchers (they can watch more than once)
+      const allGhostProxies = unusedProxyIds.length > 0 ? unusedProxyIds : proxyIds;
+      for (const pid of allGhostProxies) {
+        ghostOps.push({
+          type: 'ghost',
+          proxyId: pid,
+          slowSpeed,
+        });
+      }
+      this.log(`[Task] \ud83d\udc7b Ghost Watchers: ${ghostOps.length} (unused proxies: ${unusedProxyIds.length}, total proxies: ${proxyIds.length})`);
+    }
+
+    this.log(`[Task] Total operations: ${ops.length} engagement + ${ghostOps.length} ghost, Concurrency: ${maxConcurrency}`);
     if (proxyIds.length > 0) {
       const proxyList = this.store.get('proxies') || [];
       for (const pid of proxyIds) {
         const px = proxyList.find(p => p.id === pid);
-        if (px) this.log(`[Task] Proxy: ${px.type}://${px.host}:${px.port} (${px.country || px.countryCode || '?'}) status=${px.status}`);
+        if (px) this.log(`[Task] Proxy: ${px.type || 'http'}://${px.host}:${px.port} (${px.country || px.countryCode || '?'}) status=${px.status}`);
       }
     } else {
-      this.log('[Task] ⚠️ No proxies selected for this task');
+      this.log('[Task] \u26a0\ufe0f No proxies selected for this task');
     }
 
-    const results = { views: 0, likes: 0, comments: 0, errors: 0 };
+    const results = { views: 0, likes: 0, comments: 0, errors: 0, ghostViews: 0 };
+
+    // Combine all ops
+    const allOps = [...ops, ...ghostOps];
+    const totalOps = allOps.length;
 
     // Process in batches
-    for (let batchStart = 0; batchStart < ops.length; batchStart += maxConcurrency) {
+    for (let batchStart = 0; batchStart < totalOps; batchStart += maxConcurrency) {
       if (signal?.aborted) {
         this.log('[Task] Aborted');
         break;
       }
 
-      const batch = ops.slice(batchStart, batchStart + maxConcurrency);
-      this.log(`[Task] Batch ${Math.floor(batchStart / maxConcurrency) + 1}/${Math.ceil(ops.length / maxConcurrency)}`);
+      const batch = allOps.slice(batchStart, batchStart + maxConcurrency);
+      const batchNum = Math.floor(batchStart / maxConcurrency) + 1;
+      const totalBatches = Math.ceil(totalOps / maxConcurrency);
+      this.log(`[Task] Batch ${batchNum}/${totalBatches}`);
 
       const batchPromises = batch.map((op, idx) => {
         return new Promise(async (resolve) => {
@@ -2878,11 +3042,17 @@ class PlaywrightEngine {
           
           let opResult = null;
           try {
-            opResult = await this._executeSingleOp(op, task, settings);
-            if (opResult.viewed) results.views++;
-            if (opResult.liked) results.likes++;
-            if (opResult.commented) results.comments++;
-            if (opResult.error) results.errors++;
+            if (op.type === 'ghost') {
+              opResult = await this._ghostWatchOp(op, task, settings);
+              if (opResult.viewed) results.ghostViews++;
+              if (opResult.error) results.errors++;
+            } else {
+              opResult = await this._executeSingleOp(op, task, settings);
+              if (opResult.viewed) results.views++;
+              if (opResult.liked) results.likes++;
+              if (opResult.commented) results.comments++;
+              if (opResult.error) results.errors++;
+            }
           } catch (e) {
             results.errors++;
             this.log(`[Task] Op error: ${e.message}`);
@@ -2891,9 +3061,9 @@ class PlaywrightEngine {
           if (onProgress) {
             onProgress({
               current: batchStart + idx + 1,
-              total: ops.length,
+              total: totalOps,
               status: opResult?.error ? 'error' : 'ok',
-              message: `Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Errors: ${results.errors}`,
+              message: `Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Ghost: ${results.ghostViews}, Errors: ${results.errors}`,
             });
           }
 
@@ -2904,187 +3074,342 @@ class PlaywrightEngine {
       await Promise.all(batchPromises);
     }
 
-    this.log(`[Task] Completed. Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Errors: ${results.errors}`);
+    this.log(`[Task] Completed. Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Ghost views: ${results.ghostViews}, Errors: ${results.errors}`);
     return results;
   }
 
-  async _executeSingleOp(op, task, settings) {
-    const { accountId, proxyId, shouldLike, shouldComment, commentText, slowSpeed } = op;
-    const { videoUrl, searchKeywords, useSearch } = task;
+  /**
+   * Ghost Watch Operation — anonymous video viewing via proxy (no VK login).
+   * Navigates directly to vkvideo.ru video URL and watches for a random duration.
+   * No likes, comments, or account interaction.
+   */
+  async _ghostWatchOp(op, task, settings) {
+    const { proxyId, slowSpeed } = op;
+    const { videoUrl } = task;
     const opStart = Date.now();
 
-    const accounts = this.store.get('accounts') || [];
-    const account = accounts.find(a => a.id === accountId);
-    if (!account) {
-      this.log(`[Op] ❌ Account ${accountId} not found in store`);
-      return { error: 'Account not found' };
+    // Ensure the URL is on vkvideo.ru (the only domain that works without login)
+    let ghostUrl = videoUrl;
+    if (ghostUrl.includes('vk.com/video')) {
+      const match = ghostUrl.match(/(video-?\d+_\d+)/);
+      if (match) ghostUrl = `https://vkvideo.ru/${match[1]}`;
     }
 
+    const allProxies = this.store.get('proxies') || [];
     let proxyUrl = null;
-    let proxyInfo = 'none';
+    let proxyInfo = 'direct';
     if (proxyId) {
-      const proxies = this.store.get('proxies') || [];
-      const proxy = proxies.find(p => p.id === proxyId);
+      const proxy = allProxies.find(p => p.id === proxyId);
       if (proxy) {
         proxyUrl = this._buildProxyUrl(proxy);
-        proxyInfo = `${proxy.type}://${proxy.host}:${proxy.port} (${proxy.country || proxy.countryCode || '?'}) status=${proxy.status}`;
-      } else {
-        this.log(`[Op] ⚠️ Proxy ${proxyId} not found`);
+        proxyInfo = `${proxy.type || 'http'}://${proxy.host}:${proxy.port} (${proxy.country || proxy.countryCode || '?'})`;
       }
     }
 
-    this.log(`[Op] ─── Starting operation ───`);
-    this.log(`[Op] Account: ${account.login?.substring(0, 6) || accountId.substring(0, 8)}***, type=${account.authType}, status=${account.status}, hasCookies=${account.hasCookies}`);
-    this.log(`[Op] Proxy: ${proxyInfo}`);
-    this.log(`[Op] Video: ${videoUrl}`);
-    this.log(`[Op] Plan: view=yes${shouldLike ? ', like=yes' : ''}${shouldComment ? ', comment=yes' : ''}, search=${useSearch ? `"${searchKeywords?.substring(0, 40)}"` : 'direct'}`);
-
-    const cookiesDir = path.join(app.getPath('userData'), 'accounts');
-    const statePath = path.join(cookiesDir, `${accountId}_state.json`);
-    const cookiesPath = path.join(cookiesDir, `${accountId}_cookies.json`);
+    this.log(`[\ud83d\udc7b Ghost] \u2500\u2500\u2500 Starting ghost watch \u2500\u2500\u2500`);
+    this.log(`[\ud83d\udc7b Ghost] Proxy: ${proxyInfo}`);
+    this.log(`[\ud83d\udc7b Ghost] URL: ${ghostUrl}`);
 
     let contextId = null;
     try {
-      // Build launch options — use native storageState if available
-      const launchOpts = { 
+      const launchOpts = {
         proxy: proxyUrl,
         headless: settings.headless !== undefined ? settings.headless : false,
       };
 
-      // Prefer storageState (restores cookies + localStorage in one step)
-      if (account.hasCookies && fs.existsSync(statePath)) {
-        launchOpts.storageStatePath = statePath;
-        this.log('[Op] Using saved storage state');
-      } else if (account.hasCookies && fs.existsSync(cookiesPath)) {
-        this.log('[Op] Using saved cookies (no storage state)');
-      } else {
-        this.log('[Op] No saved session — will need full login');
-      }
-
-      const launchStart = Date.now();
       const { context, contextId: cId } = await this._launchContext(launchOpts);
       contextId = cId;
-      this.log(`[Op] Browser launched in ${((Date.now() - launchStart) / 1000).toFixed(1)}s`);
-
       const page = await context.newPage();
-      const result = { viewed: false, liked: false, commented: false, error: false };
+      const result = { viewed: false, error: false };
 
-      // ── Check session ──
-      let loggedIn = false;
-      if (account.hasCookies) {
-        // If no storageState was loaded, try manual cookies
-        if (!launchOpts.storageStatePath && fs.existsSync(cookiesPath)) {
-          try {
-            const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf-8'));
-            await this._loadCookies(context, cookies);
-            this.log(`[Op] Loaded ${cookies.length} cookies manually`);
-          } catch (e) {
-            this.log(`[Op] Failed to load cookies: ${e.message}`);
-          }
-        }
-          
-        const navOk = await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (session check)', timeout: 25000 });
-        if (navOk) {
-          await this._waitForPageReady(page);
-          await this._humanDelay(1000, 2000);
-          loggedIn = await this._checkVKLogin(page);
-        }
-        
-        if (loggedIn) {
-          this.log('[Op] ✅ Logged in via saved session');
-        } else {
-          this.log('[Op] Session expired or invalid');
-        }
-      }
+      // Navigate directly to video
+      const navOk = await this._safeGoto(page, ghostUrl, { label: 'ghost video', timeout: 30000 });
       
-      // ── Full login if needed ──
-      if (!loggedIn) {
-        if (account.authType === 'logpass' && account.login && account.password) {
-          this.log('[Op] Performing full login...');
-          const loginStart = Date.now();
-          const loginResult = await this.loginVK(page, account.login, account.password);
-          const loginTime = ((Date.now() - loginStart) / 1000).toFixed(1);
-          if (loginResult.success) {
-            loggedIn = true;
-            this.log(`[Op] ✅ Login successful in ${loginTime}s`);
-            await this._saveSession(context, accountId);
-          } else {
-            this.log(`[Op] ❌ Login failed in ${loginTime}s: ${loginResult.error}`);
-            result.error = true;
-            await this._safeClose(contextId);
-            return result;
-          }
-        } else {
-          this.log('[Op] ❌ No credentials available for login');
-          result.error = true;
-          await this._safeClose(contextId);
-          return result;
-        }
+      // Detect dead proxy
+      const currentUrl = page.url();
+      if (currentUrl.includes('chrome-error') || (!navOk && currentUrl === 'about:blank')) {
+        this.log(`[\ud83d\udc7b Ghost] \u274c Proxy error: ${currentUrl.substring(0, 50)}`);
+        await this._safeClose(contextId);
+        return { viewed: false, error: true };
       }
 
-      // ── Warm-up browsing ──
-      if (settings.warmUp) {
-        const warmStart = Date.now();
-        await this.warmUpBrowsing(page);
-        this.log(`[Op] Warm-up completed in ${((Date.now() - warmStart) / 1000).toFixed(1)}s`);
-      }
+      await this._waitForPageReady(page);
+      await this._humanDelay(2000, 3000);
+      this.log(`[\ud83d\udc7b Ghost] Page loaded: ${page.url().substring(0, 80)}`);
 
-      // ── Navigate to video ──
-      const navStart = Date.now();
-      if (useSearch && searchKeywords) {
-        const found = await this.searchAndFindVideo(page, searchKeywords, videoUrl);
-        if (!found && videoUrl) {
-          this.log('[Op] Search failed, navigating directly to video URL...');
-          await this._safeGoto(page, videoUrl, { label: 'video direct', timeout: 30000 });
-          await this._humanDelay(2000, 3000);
-        }
-      } else {
-        await this._safeGoto(page, videoUrl, { label: 'video direct', timeout: 30000 });
-        await this._waitForPageReady(page);
-        await this._humanDelay(2000, 3000);
-      }
-      this.log(`[Op] Navigation to video took ${((Date.now() - navStart) / 1000).toFixed(1)}s`);
-      this.log(`[Op] Current URL: ${page.url().substring(0, 100)}`);
-
-      // ── Set 0.25x speed if requested ──
+      // Set speed if requested
       if (slowSpeed) {
         await this._setPlaybackSpeed025(page);
       }
 
-      // ── Watch video ──
+      // Watch video
       const watchDuration = this._randomDelay(
         settings.watchDuration?.min || 30,
         settings.watchDuration?.max || 120
       );
-      await this.watchVideo(page, watchDuration);
-      result.viewed = true;
-
-      // ── Like ──
-      if (shouldLike) {
-        const liked = await this.pressLike(page);
-        result.liked = liked;
-        this.log(`[Op] Like: ${liked ? '✅' : '❌'}`);
-      }
-
-      // ── Comment ──
-      if (shouldComment && commentText) {
-        const commented = await this.postComment(page, commentText);
-        result.commented = commented;
-        this.log(`[Op] Comment: ${commented ? '✅' : '❌'}`);
-      }
+      const watched = await this.watchVideo(page, watchDuration);
+      result.viewed = watched;
 
       const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
-      this.log(`[Op] ─── Operation complete in ${totalTime}s ─── viewed=${result.viewed}, liked=${result.liked}, commented=${result.commented}`);
+      this.log(`[\ud83d\udc7b Ghost] \u2500\u2500\u2500 Ghost watch complete in ${totalTime}s \u2500\u2500\u2500 viewed=${result.viewed}`);
 
       await this._safeClose(contextId);
       return result;
 
     } catch (error) {
       const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
-      this.log(`[Op] ❌ Error after ${totalTime}s: ${error.message}`);
+      this.log(`[\ud83d\udc7b Ghost] \u274c Error after ${totalTime}s: ${error.message}`);
       if (contextId) await this._safeClose(contextId);
-      return { viewed: false, liked: false, commented: false, error: true };
+      return { viewed: false, error: true };
     }
+  }
+
+  async _executeSingleOp(op, task, settings) {
+    const { accountId, shouldLike, shouldComment, commentText, slowSpeed } = op;
+    const { videoUrl, searchKeywords, useSearch, searchScrollCount = 0, proxyIds: taskProxyIds = [] } = task;
+    const opStart = Date.now();
+
+    const accounts = this.store.get('accounts') || [];
+    const account = accounts.find(a => a.id === accountId);
+    if (!account) {
+      this.log(`[Op] \u274c Account ${accountId} not found in store`);
+      return { error: 'Account not found' };
+    }
+
+    // Build ordered proxy list for failover: primary first, then remaining task proxies
+    const allProxies = this.store.get('proxies') || [];
+    const proxyQueue = [];
+    // Primary proxy from op
+    if (op.proxyId) proxyQueue.push(op.proxyId);
+    // Add remaining task proxies as fallbacks (excluding primary)
+    for (const pid of taskProxyIds) {
+      if (!proxyQueue.includes(pid)) proxyQueue.push(pid);
+    }
+
+    this.log(`[Op] \u2500\u2500\u2500 Starting operation \u2500\u2500\u2500`);
+    this.log(`[Op] Account: ${account.login?.substring(0, 6) || accountId.substring(0, 8)}***, type=${account.authType}, status=${account.status}, hasCookies=${account.hasCookies}`);
+    this.log(`[Op] Video: ${videoUrl}`);
+    this.log(`[Op] Plan: view=yes${shouldLike ? ', like=yes' : ''}${shouldComment ? ', comment=yes' : ''}, search=${useSearch ? `"${searchKeywords?.substring(0, 40)}"` : 'direct'}`);
+    this.log(`[Op] Proxy queue: ${proxyQueue.length} (primary=${op.proxyId ? op.proxyId.substring(0, 8) : 'none'}, fallbacks=${proxyQueue.length - (op.proxyId ? 1 : 0)})`);
+
+    const cookiesDir = path.join(app.getPath('userData'), 'accounts');
+    const statePath = path.join(cookiesDir, `${accountId}_state.json`);
+    const cookiesPath = path.join(cookiesDir, `${accountId}_cookies.json`);
+
+    // Try each proxy in order (failover). Empty string = "no proxy" (direct)
+    const proxyAttempts = proxyQueue.length > 0 ? [...proxyQueue] : [null];
+    // If task allows direct connection, add null (direct) as last resort
+    if (task.allowDirect && proxyQueue.length > 0) proxyAttempts.push(null);
+
+    for (let proxyAttempt = 0; proxyAttempt < proxyAttempts.length; proxyAttempt++) {
+      const currentProxyId = proxyAttempts[proxyAttempt];
+      let proxyUrl = null;
+      let proxyInfo = 'direct (no proxy)';
+      
+      if (currentProxyId) {
+        const proxy = allProxies.find(p => p.id === currentProxyId);
+        if (proxy) {
+          proxyUrl = this._buildProxyUrl(proxy);
+          proxyInfo = `${proxy.type || 'http'}://${proxy.host}:${proxy.port} (${proxy.country || proxy.countryCode || '?'}) status=${proxy.status}`;
+        } else {
+          this.log(`[Op] \u26a0\ufe0f Proxy ${currentProxyId} not found, skipping`);
+          continue;
+        }
+      }
+      
+      if (proxyAttempt > 0) {
+        this.log(`[Op] \ud83d\udd04 Proxy failover attempt ${proxyAttempt + 1}/${proxyAttempts.length}`);
+      }
+      this.log(`[Op] Proxy: ${proxyInfo}`);
+
+      let contextId = null;
+      try {
+        // Build launch options
+        const launchOpts = { 
+          proxy: proxyUrl,
+          headless: settings.headless !== undefined ? settings.headless : false,
+        };
+
+        // Prefer storageState (restores cookies + localStorage in one step)
+        if (account.hasCookies && fs.existsSync(statePath)) {
+          launchOpts.storageStatePath = statePath;
+          this.log('[Op] Using saved storage state');
+        } else if (account.hasCookies && fs.existsSync(cookiesPath)) {
+          this.log('[Op] Using saved cookies (no storage state)');
+        } else {
+          this.log('[Op] No saved session \u2014 will need full login');
+        }
+
+        const launchStart = Date.now();
+        const { context, contextId: cId } = await this._launchContext(launchOpts);
+        contextId = cId;
+        this.log(`[Op] Browser launched in ${((Date.now() - launchStart) / 1000).toFixed(1)}s`);
+
+        const page = await context.newPage();
+        const result = { viewed: false, liked: false, commented: false, error: false };
+
+        // ── Check session ──
+        let loggedIn = false;
+        if (account.hasCookies) {
+          // If no storageState was loaded, try manual cookies
+          if (!launchOpts.storageStatePath && fs.existsSync(cookiesPath)) {
+            try {
+              const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf-8'));
+              await this._loadCookies(context, cookies);
+              this.log(`[Op] Loaded ${cookies.length} cookies manually`);
+            } catch (e) {
+              this.log(`[Op] Failed to load cookies: ${e.message}`);
+            }
+          }
+            
+          const navOk = await this._safeGoto(page, 'https://vk.com/feed', { label: 'VK feed (session check)', timeout: 25000 });
+          
+          // Detect dead proxy: chrome-error:// or about:blank
+          const currentUrl = page.url();
+          if (currentUrl.includes('chrome-error') || (!navOk && currentUrl === 'about:blank')) {
+            this.log(`[Op] \u274c Proxy error detected (${currentUrl.substring(0, 50)}), will try next proxy...`);
+            await this._safeClose(contextId);
+            contextId = null;
+            // Mark this proxy as failed if it exists
+            if (currentProxyId) {
+              const proxyIdx = allProxies.findIndex(p => p.id === currentProxyId);
+              if (proxyIdx !== -1) {
+                allProxies[proxyIdx].status = 'error';
+                allProxies[proxyIdx].lastError = new Date().toISOString();
+                this.store.set('proxies', allProxies);
+              }
+            }
+            continue; // Try next proxy
+          }
+          
+          if (navOk) {
+            await this._waitForPageReady(page);
+            await this._humanDelay(1000, 2000);
+            loggedIn = await this._checkVKLogin(page);
+          }
+          
+          if (loggedIn) {
+            this.log('[Op] \u2705 Logged in via saved session');
+          } else {
+            this.log('[Op] Session expired or invalid');
+          }
+        }
+        
+        // ── Full login if needed ──
+        if (!loggedIn) {
+          if (account.authType === 'logpass' && account.login && account.password) {
+            this.log('[Op] Performing full login...');
+            const loginStart = Date.now();
+            const loginResult = await this.loginVK(page, account.login, account.password);
+            const loginTime = ((Date.now() - loginStart) / 1000).toFixed(1);
+            
+            // Check if login failed due to proxy error
+            const postLoginUrl = page.url();
+            if (postLoginUrl.includes('chrome-error')) {
+              this.log(`[Op] \u274c Proxy error during login, will try next proxy...`);
+              await this._safeClose(contextId);
+              contextId = null;
+              continue;
+            }
+            
+            if (loginResult.success) {
+              loggedIn = true;
+              this.log(`[Op] \u2705 Login successful in ${loginTime}s`);
+              await this._saveSession(context, accountId);
+            } else {
+              this.log(`[Op] \u274c Login failed in ${loginTime}s: ${loginResult.error}`);
+              result.error = true;
+              await this._safeClose(contextId);
+              return result;
+            }
+          } else {
+            this.log('[Op] \u274c No credentials available for login');
+            result.error = true;
+            await this._safeClose(contextId);
+            return result;
+          }
+        }
+
+        // ── Warm-up browsing ──
+        if (settings.warmUp) {
+          const warmStart = Date.now();
+          await this.warmUpBrowsing(page);
+          this.log(`[Op] Warm-up completed in ${((Date.now() - warmStart) / 1000).toFixed(1)}s`);
+        }
+
+        // ── Navigate to video ──
+        const navStart = Date.now();
+        if (useSearch && searchKeywords) {
+          const found = await this.searchAndFindVideo(page, searchKeywords, videoUrl, searchScrollCount);
+          if (!found && videoUrl) {
+            this.log('[Op] Search failed, navigating directly to video URL...');
+            await this._safeGoto(page, videoUrl, { label: 'video direct', timeout: 30000 });
+            await this._humanDelay(2000, 3000);
+          }
+        } else {
+          await this._safeGoto(page, videoUrl, { label: 'video direct', timeout: 30000 });
+          await this._waitForPageReady(page);
+          await this._humanDelay(2000, 3000);
+        }
+        this.log(`[Op] Navigation to video took ${((Date.now() - navStart) / 1000).toFixed(1)}s`);
+        this.log(`[Op] Current URL: ${page.url().substring(0, 100)}`);
+
+        // ── Set 0.25x speed if requested ──
+        if (slowSpeed) {
+          await this._setPlaybackSpeed025(page);
+        }
+
+        // ── Watch video ──
+        const watchDuration = this._randomDelay(
+          settings.watchDuration?.min || 30,
+          settings.watchDuration?.max || 120
+        );
+        await this.watchVideo(page, watchDuration);
+        result.viewed = true;
+
+        // ── Like ──
+        if (shouldLike) {
+          const liked = await this.pressLike(page);
+          result.liked = liked;
+          this.log(`[Op] Like: ${liked ? '\u2705' : '\u274c'}`);
+        }
+
+        // ── Comment ──
+        if (shouldComment && commentText) {
+          const commented = await this.postComment(page, commentText);
+          result.commented = commented;
+          this.log(`[Op] Comment: ${commented ? '\u2705' : '\u274c'}`);
+        }
+
+        const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
+        this.log(`[Op] \u2500\u2500\u2500 Operation complete in ${totalTime}s \u2500\u2500\u2500 viewed=${result.viewed}, liked=${result.liked}, commented=${result.commented}`);
+
+        await this._safeClose(contextId);
+        return result;
+
+      } catch (error) {
+        const totalTime = ((Date.now() - opStart) / 1000).toFixed(1);
+        this.log(`[Op] \u274c Error after ${totalTime}s: ${error.message}`);
+        if (contextId) await this._safeClose(contextId);
+        
+        // If it looks like a proxy/network error, try next proxy
+        const errMsg = error.message.toLowerCase();
+        if (proxyAttempt < proxyAttempts.length - 1 && (
+          errMsg.includes('net::err_') || errMsg.includes('proxy') || 
+          errMsg.includes('connection') || errMsg.includes('timeout') ||
+          errMsg.includes('chrome-error') || errMsg.includes('econnrefused')
+        )) {
+          this.log(`[Op] Network/proxy error, will try next proxy...`);
+          continue;
+        }
+        
+        return { viewed: false, liked: false, commented: false, error: true };
+      }
+    }
+
+    // All proxies exhausted
+    this.log(`[Op] \u274c All proxies exhausted (${proxyAttempts.length} tried). Operation failed.`);
+    return { viewed: false, liked: false, commented: false, error: true };
   }
 
   // ============================================================
