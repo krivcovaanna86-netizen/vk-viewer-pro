@@ -25,20 +25,28 @@
       {
         "from": "data",
         "to": "data",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "category": "Utility",
       "icon": "src/renderer/assets/icon.png"
     },
     "win": {
-      "target": ["portable"],
+      "target": [
+        "portable"
+      ],
       "icon": "src/renderer/assets/icon.png"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "src/renderer/assets/icon.png"
     }
   },
@@ -46,7 +54,7 @@
     "electron-store": "^8.1.0",
     "fingerprint-generator": "^2.1.0",
     "fingerprint-injector": "^2.1.0",
-    "playwright": "1.40.0",
+    "playwright": "^1.40.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "uuid": "^9.0.0"

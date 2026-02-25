@@ -6,3 +6,4 @@ dist/
 *.dmg
 .DS_Store
 Thumbs.db
+package-lock.json

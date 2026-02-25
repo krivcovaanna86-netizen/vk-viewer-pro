@@ -286,87 +286,363 @@ class PlaywrightEngine {
 
   // ──────── VK Login (login/pass) ────────
 
+  /**
+   * Detect whether login string is a phone number.
+   * Accepts: +79..., 89..., 79..., 9... (10 digits), etc.
+   */
+  _isPhoneNumber(login) {
+    const cleaned = login.replace(/[\s\-\(\)]/g, '');
+    // Starts with + and has digits
+    if (/^\+\d{10,15}$/.test(cleaned)) return true;
+    // Russian phone: 8 or 7 followed by 10 digits
+    if (/^[78]\d{10}$/.test(cleaned)) return true;
+    // Just 10 digits starting with 9 (Russian mobile without prefix)
+    if (/^9\d{9}$/.test(cleaned)) return true;
+    return false;
+  }
+
+  /**
+   * Normalize phone to just the 10 digits (without country code).
+   * E.g. "+79808673324" -> "9808673324", "89808673324" -> "9808673324"
+   */
+  _normalizePhone(login) {
+    const cleaned = login.replace(/[\s\-\(\)]/g, '');
+    // +7XXXXXXXXXX -> XXXXXXXXXX
+    if (cleaned.startsWith('+7') && cleaned.length === 12) return cleaned.slice(2);
+    // 8XXXXXXXXXX -> XXXXXXXXXX  or  7XXXXXXXXXX -> XXXXXXXXXX
+    if (/^[78]\d{10}$/.test(cleaned)) return cleaned.slice(1);
+    // Already 10 digits
+    if (/^9\d{9}$/.test(cleaned)) return cleaned;
+    return cleaned;
+  }
+
   async loginVK(page, login, password) {
     this._log('info', `VK login: ${login}...`);
     try {
+      // ── Step 1: Navigate to vk.com ──
       await page.goto('https://vk.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(this.randomInt(2000, 4000));
 
-      // Click "Sign in" button
-      const signInBtn = page.locator('button:has-text("Sign in"), button:has-text("Войти"), a:has-text("Войти"), [data-testid="loginButton"]').first();
-      if (await signInBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await signInBtn.click();
-        await page.waitForTimeout(this.randomInt(1500, 3000));
+      // ── Step 1a: Handle robot challenge "Проверяем, что вы не робот" ──
+      const robotChallenge = await this._handleRobotChallenge(page);
+      if (robotChallenge === 'blocked') {
+        return { success: false, error: 'robot_challenge', details: 'VK robot verification required, try with proxy or later' };
       }
 
-      // Enter phone/email
-      const loginInput = page.locator('input[name="login"], input[type="tel"], input[name="email"], #index_email').first();
-      await loginInput.waitFor({ timeout: 10000 });
+      // ── Step 2: Click "Войти другим способом" to switch from QR to phone/email form ──
+      const altLoginBtn = page.locator('button:has-text("Войти другим способом")').first();
+      if (await altLoginBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
+        await altLoginBtn.click();
+        this._log('info', 'Clicked "Войти другим способом"');
+        await page.waitForTimeout(this.randomInt(2000, 4000));
+      } else {
+        this._log('warn', '"Войти другим способом" button not found, trying direct login page...');
+        // Fallback: try going to id.vk.com directly
+        await page.goto('https://id.vk.com/auth', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(this.randomInt(2000, 4000));
+      }
+
+      // ── Step 3: Determine login type (phone vs email) and select radio ──
+      const isPhone = this._isPhoneNumber(login);
+      this._log('info', `Login type: ${isPhone ? 'phone' : 'email/login'}`);
+
+      if (isPhone) {
+        // Make sure "Телефон" radio is selected (it's default, but be safe)
+        const phoneRadio = page.locator('input[name="login-view"][value="phone"]');
+        if (await phoneRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
+          const isChecked = await phoneRadio.isChecked().catch(() => true);
+          if (!isChecked) {
+            await phoneRadio.click();
+            await page.waitForTimeout(this.randomInt(500, 1000));
+          }
+        }
+      } else {
+        // Select "Почта" radio for email/login input
+        const emailRadio = page.locator('input[name="login-view"][value="email"]');
+        if (await emailRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await emailRadio.click();
+          await page.waitForTimeout(this.randomInt(500, 1000));
+          this._log('info', 'Switched to email/login mode');
+        } else {
+          // Try clicking the label
+          const emailLabel = page.locator('label:has-text("Почта")').first();
+          if (await emailLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await emailLabel.click();
+            await page.waitForTimeout(this.randomInt(500, 1000));
+          }
+        }
+      }
+
+      // ── Step 4: Enter login ──
+      const loginInput = page.locator('input[name="login"]').first();
+      await loginInput.waitFor({ state: 'visible', timeout: 10000 });
       await loginInput.click();
-      await page.waitForTimeout(this.randomInt(300, 800));
-      await this.typeHumanLike(loginInput, login);
+      await page.waitForTimeout(this.randomInt(300, 700));
+
+      if (isPhone) {
+        // Phone input has "+7 " pre-filled. Clear it and type just the 10 digits.
+        // VK auto-formats to "+7 XXX XXX XX XX"
+        const phoneDigits = this._normalizePhone(login);
+        // Triple-click to select all, then delete
+        await loginInput.click({ clickCount: 3 });
+        await page.waitForTimeout(200);
+        await page.keyboard.press('Backspace');
+        await page.waitForTimeout(200);
+        // Now type the digits — VK will auto-add "+7 " prefix
+        await this.typeHumanLike(loginInput, phoneDigits);
+      } else {
+        // For email/login: clear and type
+        await loginInput.fill('');
+        await page.waitForTimeout(200);
+        await this.typeHumanLike(loginInput, login);
+      }
       await page.waitForTimeout(this.randomInt(500, 1500));
 
-      // Click "Sign in" / "Continue"
-      const continueBtn = page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Войти"), button:has-text("Continue"), button:has-text("Продолжить")').first();
-      await continueBtn.click();
-      await page.waitForTimeout(this.randomInt(2000, 4000));
-
-      // Enter password
-      const passInput = page.locator('input[name="password"], input[type="password"]').first();
-      if (await passInput.isVisible({ timeout: 10000 }).catch(() => false)) {
-        await passInput.click();
-        await page.waitForTimeout(this.randomInt(300, 800));
-        await this.typeHumanLike(passInput, password);
-        await page.waitForTimeout(this.randomInt(500, 1500));
-
-        const submitBtn = page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Войти"), button:has-text("Continue"), button:has-text("Продолжить")').first();
-        await submitBtn.click();
-        await page.waitForTimeout(this.randomInt(3000, 6000));
+      // ── Step 5: Click "Войти" to submit phone/email ──
+      const submitLoginBtn = page.locator('button:has-text("Войти")').first();
+      if (await submitLoginBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await submitLoginBtn.click();
+        this._log('info', 'Clicked "Войти" — waiting for next step...');
+      } else {
+        // Fallback: press Enter
+        await page.keyboard.press('Enter');
+        this._log('info', 'Pressed Enter to submit login');
       }
+      await page.waitForTimeout(this.randomInt(4000, 7000));
 
-      // Check if captcha appeared
-      const hasCaptcha = await page.locator('img[src*="captcha"], .captcha_img, #captcha, [class*="captcha"]').isVisible({ timeout: 3000 }).catch(() => false);
+      // ── Step 6: Check what happened — OTP page, password page, error, or captcha ──
+      const currentUrl = page.url();
+      this._log('info', `After login submit: ${currentUrl.substring(0, 80)}...`);
+
+      // Check for captcha
+      const hasCaptcha = await page.evaluate(() => {
+        const bodyText = document.body.innerText || '';
+        return bodyText.includes('captcha') || bodyText.includes('каптча') ||
+               !!document.querySelector('[class*="captcha"], [class*="Captcha"], img[src*="captcha"]');
+      });
       if (hasCaptcha) {
         this._log('warn', 'CAPTCHA detected during VK login');
         return { success: false, error: 'captcha', details: 'Captcha appeared during login' };
       }
 
-      // Check if we're logged in
+      // Check for error messages (e.g. "Пользователь не найден")
+      const loginError = await page.evaluate(() => {
+        const errorEls = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"]');
+        for (const el of errorEls) {
+          if (el.offsetWidth > 0 && el.textContent.trim()) return el.textContent.trim();
+        }
+        return null;
+      });
+      if (loginError) {
+        this._log('error', `VK login error: ${loginError}`);
+        return { success: false, error: 'login_error', details: loginError };
+      }
+
+      // ── Step 6a: Handle OTP (SMS code) page ──
+      // VK now shows OTP by default. We need to click "Подтвердить другим способом" to get password field.
+      const otpInput = page.locator('input[name="otp-cell"]').first();
+      const hasOtp = await otpInput.isVisible({ timeout: 3000 }).catch(() => false);
+
+      if (hasOtp) {
+        this._log('info', 'OTP page detected — clicking "Подтвердить другим способом" for password...');
+        const altConfirmBtn = page.locator('button:has-text("Подтвердить другим способом")').first();
+        if (await altConfirmBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+          await altConfirmBtn.click();
+          await page.waitForTimeout(this.randomInt(2000, 4000));
+        } else {
+          this._log('warn', 'Cannot find "Подтвердить другим способом" — only SMS/OTP available');
+          return { success: false, error: 'otp_only', details: 'Account requires SMS code, password option not available' };
+        }
+      }
+
+      // ── Step 6b: Handle "Выберите способ подтверждения" popup ──
+      // This popup offers: QR-код, Код на телефон, Восстановить доступ, and may also show password
+      await this._dismissConfirmationPopup(page);
+
+      // ── Step 7: Enter password ──
+      const passInput = page.locator('input[name="password"], input[type="password"]').first();
+      const hasPassword = await passInput.isVisible({ timeout: 8000 }).catch(() => false);
+
+      if (hasPassword) {
+        this._log('info', 'Password field found — entering password...');
+        await passInput.click();
+        await page.waitForTimeout(this.randomInt(300, 700));
+        await this.typeHumanLike(passInput, password);
+        await page.waitForTimeout(this.randomInt(500, 1500));
+
+        // Click "Продолжить" (Continue)
+        const continueBtn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button[type="submit"]').first();
+        if (await continueBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+          await continueBtn.click();
+          this._log('info', 'Clicked "Продолжить" — waiting for result...');
+        } else {
+          await page.keyboard.press('Enter');
+        }
+        await page.waitForTimeout(this.randomInt(5000, 8000));
+      } else {
+        this._log('warn', 'No password field found');
+        // Maybe we're already on a 2FA challenge or some other state
+        const pageText = await page.evaluate(() => document.body.innerText.substring(0, 300));
+        return { success: false, error: 'no_password_field', details: `Page state: ${pageText.substring(0, 150)}` };
+      }
+
+      // ── Step 8: After password — check for 2FA, additional challenges, or success ──
+
+      // Check for "Выберите способ подтверждения" again (may appear after password)
+      await this._dismissConfirmationPopup(page);
+
+      // Check for 2FA code input
+      const has2fa = await page.locator('input[name="otp-cell"], input[name="code"]').first()
+        .isVisible({ timeout: 3000 }).catch(() => false);
+      if (has2fa) {
+        this._log('warn', '2FA code requested after password');
+        return { success: false, error: 'challenge', details: '2FA verification code required after password' };
+      }
+
+      // Check for another captcha after password
+      const hasCaptcha2 = await page.evaluate(() => {
+        return !!document.querySelector('[class*="captcha"], [class*="Captcha"], img[src*="captcha"]');
+      });
+      if (hasCaptcha2) {
+        this._log('warn', 'CAPTCHA detected after password');
+        return { success: false, error: 'captcha', details: 'Captcha appeared after password entry' };
+      }
+
+      // Check for error after password
+      const passError = await page.evaluate(() => {
+        const errorEls = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"]');
+        for (const el of errorEls) {
+          const text = el.textContent.trim();
+          if (el.offsetWidth > 0 && text && text.length > 3) return text;
+        }
+        // Also check for "Неверный пароль"
+        const bodyText = document.body.innerText || '';
+        if (bodyText.includes('Неверный пароль') || bodyText.includes('Incorrect password')) {
+          return 'Неверный пароль';
+        }
+        return null;
+      });
+      if (passError) {
+        this._log('error', `Password error: ${passError}`);
+        return { success: false, error: 'wrong_password', details: passError };
+      }
+
+      // ── Step 9: Check if we're logged in ──
       const isLoggedIn = await this._checkVKLogin(page);
       if (isLoggedIn) {
         this._log('success', `VK login successful: ${login}`);
-        // Save cookies for future use
         const cookies = await page.context().cookies();
         return { success: true, cookies };
       }
 
-      // Check for security challenge
-      const hasChallenge = await page.locator('[class*="security"], [class*="confirm"], input[name="code"]').isVisible({ timeout: 3000 }).catch(() => false);
-      if (hasChallenge) {
-        this._log('warn', 'Security challenge detected');
-        return { success: false, error: 'challenge', details: '2FA or security check required' };
-      }
-
-      this._log('error', 'VK login failed — unknown state');
-      return { success: false, error: 'unknown', details: `URL: ${page.url()}` };
+      // Final unknown state
+      const finalUrl = page.url();
+      const finalText = await page.evaluate(() => document.body.innerText.substring(0, 200));
+      this._log('error', `VK login failed — unknown state at: ${finalUrl.substring(0, 80)}`);
+      return { success: false, error: 'unknown', details: `URL: ${finalUrl.substring(0, 100)}, Text: ${finalText.substring(0, 100)}` };
     } catch (e) {
       this._log('error', `VK login error: ${e.message}`);
       return { success: false, error: 'exception', details: e.message };
     }
   }
 
+  /**
+   * Dismiss the "Выберите способ подтверждения" popup that may appear.
+   * This popup offers QR-код, Код на телефон, etc.
+   * We try to close it so the password form remains accessible.
+   */
+  async _dismissConfirmationPopup(page) {
+    try {
+      // Look for the popup with "Выберите способ подтверждения" or "Закрыть"
+      const closeBtn = page.locator('button:has-text("Закрыть")').first();
+      if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await closeBtn.click();
+        this._log('info', 'Dismissed "Выберите способ подтверждения" popup');
+        await page.waitForTimeout(this.randomInt(500, 1000));
+        return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
+  /**
+   * Handle VK "Проверяем, что вы не робот" (robot challenge) page.
+   * This page appears when VK suspects automated access.
+   * It typically has a "Продолжить" button that when clicked may solve the challenge
+   * or redirect to a CAPTCHA.
+   * Returns: 'passed' if challenge handled, 'blocked' if cannot proceed, 'none' if no challenge.
+   */
+  async _handleRobotChallenge(page) {
+    try {
+      const url = page.url();
+      const isChallenge = url.includes('challenge.html') || url.includes('/challenge');
+      if (!isChallenge) {
+        // Also check by page text
+        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300));
+        if (!bodyText.includes('не робот') && !bodyText.includes('not a robot')) return 'none';
+      }
+
+      this._log('warn', 'VK robot challenge detected — attempting to pass...');
+
+      // Try clicking "Продолжить" (Continue) button on the challenge page
+      const continueBtn = page.locator('button:has-text("Продолжить")').first();
+      if (await continueBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await continueBtn.click();
+        await page.waitForTimeout(this.randomInt(5000, 8000));
+
+        // Check if we got through
+        const newUrl = page.url();
+        if (!newUrl.includes('challenge')) {
+          this._log('success', 'Robot challenge passed');
+          return 'passed';
+        }
+      }
+
+      // If still on challenge page, check for CAPTCHA
+      const hasCaptcha = await page.evaluate(() => {
+        return !!document.querySelector('iframe[src*="captcha"], [class*="captcha"], [class*="Captcha"]');
+      });
+      if (hasCaptcha) {
+        this._log('warn', 'Robot challenge requires CAPTCHA');
+        return 'blocked';
+      }
+
+      this._log('warn', 'Robot challenge could not be resolved');
+      return 'blocked';
+    } catch (e) {
+      this._log('warn', `Robot challenge handler error: ${e.message}`);
+      return 'none';
+    }
+  }
+
   async _checkVKLogin(page) {
     try {
       const url = page.url();
-      if (url.includes('/feed') || url.includes('/id') || url.includes('/im')) return true;
+      // After successful login, VK redirects to feed or profile
+      if (url.includes('/feed') || url.match(/\/id\d/) || url.includes('/im')) return true;
+      // vk.com main page when logged in (no /auth in URL)
+      if (url === 'https://vk.com/' || url === 'https://vk.com') {
+        // Need to verify we're actually logged in, not just on the landing page
+      }
 
       const loggedIn = await page.evaluate(() => {
-        // Check for VK logged-in indicators
         const selectors = [
-          '#top_profile_link', '#top_nav_btn', '.TopNavBtn',
-          '[class*="TopProfileLink"]', '.page_block',
-          'a[href*="/im"]', '#l_msg', '#l_pr',
+          // Modern VK UI (2024-2026) selectors
+          'a[href*="/im"]',          // Messages link in navbar
+          '[class*="TopNavBtn"]',    // Top nav buttons (logged in)
+          '#l_msg',                  // Left menu: messages
+          '#l_pr',                   // Left menu: profile
+          'a[href*="/feed"]',        // Feed link
+          '[class*="ProfileLink"]',  // Profile link in header
+          '[class*="TopSearch"]',    // Top search (only when logged in on main page)
+          'a[href*="/settings"]',    // Settings link
+          '.page_block',             // Page content block
+          // Sidebar navigation elements
+          'a[href*="/friends"]',     // Friends link
+          'a[href*="/groups"]',      // Groups link
+          // VK ID callback: check if the page has user data
+          '[data-task-click="ProfileAction/toggle"]',
+          '.TopHomeLink',
         ];
         return selectors.some(s => document.querySelector(s));
       });
@@ -380,20 +656,24 @@ class PlaywrightEngine {
     const account = this.accountManager.getById(accountId);
     if (!account) return { valid: false, error: 'Account not found' };
 
+    // Use headless setting from user settings (same as tasks)
+    const settings = this.store.get('settings');
+    const isHeadless = settings.headless;
+
     // For logpass accounts — attempt actual VK login to verify
     if (account.authType === 'logpass') {
       if (!account.login || !account.password) {
         return { valid: false, error: 'No login/password set' };
       }
 
-      this._log('info', `Verifying VK logpass account "${account.name}" via login...`);
+      this._log('info', `Verifying VK logpass account "${account.name}" via login (headless: ${isHeadless})...`);
       let contextObj = null;
       try {
         const proxy = proxyId ? this.proxyManager.getById(proxyId) :
           (account.proxyId ? this.proxyManager.getById(account.proxyId) : null);
         const proxyUrl = proxy ? this._buildProxyUrl(proxy) : null;
 
-        contextObj = await this.launchContext({ proxyUrl, headless: true, accountId });
+        contextObj = await this.launchContext({ proxyUrl, headless: isHeadless, accountId });
         const { context } = contextObj;
 
         // If this account already has saved cookies from a previous successful login, load them first
@@ -456,14 +736,14 @@ class PlaywrightEngine {
     const cookies = this.accountManager.getCookies(accountId);
     if (!cookies || !cookies.length) return { valid: false, error: 'No cookies' };
 
-    this._log('info', `Verifying VK account "${account.name}"...`);
+    this._log('info', `Verifying VK account "${account.name}" cookies (headless: ${isHeadless})...`);
     let contextObj = null;
     try {
       const proxy = proxyId ? this.proxyManager.getById(proxyId) :
         (account.proxyId ? this.proxyManager.getById(account.proxyId) : null);
       const proxyUrl = proxy ? this._buildProxyUrl(proxy) : null;
 
-      contextObj = await this.launchContext({ proxyUrl, headless: true, accountId });
+      contextObj = await this.launchContext({ proxyUrl, headless: isHeadless, accountId });
       const { context } = contextObj;
       await this.loadCookies(context, accountId);
 
@@ -955,15 +1235,15 @@ class PlaywrightEngine {
       context = launched.context;
       if (signal?.aborted) throw new Error('Aborted');
 
-      // Load cookies if cookie-based account
+      // Load cookies if cookie-based account or logpass with saved cookies
       if (account.authType === 'cookies' || account.hasCookies) {
         await this.loadCookies(context, op.accountId);
       }
 
       const page = await context.newPage();
 
-      // Login if logpass account
-      if (account.authType === 'logpass' && account.login && account.password) {
+      // Login if logpass account without saved cookies
+      if (account.authType === 'logpass' && account.login && account.password && !account.hasCookies) {
         const loginResult = await this.loginVK(page, account.login, account.password);
         if (!loginResult.success) {
           this._log('error', `Login failed for ${accName}: ${loginResult.error}`);
@@ -974,6 +1254,24 @@ class PlaywrightEngine {
         if (loginResult.cookies) {
           this.accountManager.setCookiesRaw(op.accountId, loginResult.cookies, 'playwright');
           this.accountManager.updateAccount(op.accountId, { status: 'valid', hasCookies: true });
+        }
+      } else if (account.authType === 'logpass' && account.hasCookies) {
+        // Logpass account with saved cookies — verify they still work
+        await page.goto('https://vk.com/feed', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(3000);
+        const cookiesValid = await this._checkVKLogin(page);
+        if (!cookiesValid) {
+          this._log('info', `Saved cookies expired for ${accName}, re-logging in...`);
+          const loginResult = await this.loginVK(page, account.login, account.password);
+          if (!loginResult.success) {
+            this._log('error', `Re-login failed for ${accName}: ${loginResult.error}`);
+            await this._safeContextClose(context);
+            return { op: opIdx + 1, account: accName, status: 'error', error: `Re-login failed: ${loginResult.error}` };
+          }
+          if (loginResult.cookies) {
+            this.accountManager.setCookiesRaw(op.accountId, loginResult.cookies, 'playwright');
+            this.accountManager.updateAccount(op.accountId, { status: 'valid', hasCookies: true });
+          }
         }
       }
 
