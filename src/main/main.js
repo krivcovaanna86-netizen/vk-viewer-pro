@@ -161,19 +161,15 @@ function setupIPC() {
   ipcMain.handle('account:remove', (_, id) => {
     const acc = accountManager.getById(id);
     accountManager.remove(id);
-    playwrightEngine.deleteFingerprint(id);
     sendLog('info', `Account removed: ${acc?.name || id}`);
     return true;
   });
   ipcMain.handle('account:bulkRemove', (_, ids) => {
-    for (const id of ids) playwrightEngine.deleteFingerprint(id);
     const r = accountManager.bulkRemove(ids);
     sendLog('info', `Removed ${r.removed} accounts`);
     return r;
   });
   ipcMain.handle('account:removeInvalid', () => {
-    const invalid = accountManager.getAll().filter(a => a.status === 'invalid' || a.status === 'blocked');
-    for (const a of invalid) playwrightEngine.deleteFingerprint(a.id);
     const r = accountManager.removeInvalid();
     sendLog('info', `Removed ${r.removed} invalid/blocked accounts`);
     return r;
@@ -181,7 +177,7 @@ function setupIPC() {
   ipcMain.handle('account:importLogpass', (_, rawText) => {
     sendLog('info', 'Importing VK login:password accounts...');
     const r = accountManager.bulkImportLogpass(rawText);
-    sendLog('success', `Imported ${r.created} accounts from ${r.total} lines`);
+    sendLog('success', `Imported ${r.created} accounts from ${r.total} lines${r.skipped ? ` (${r.skipped} duplicates skipped)` : ''}`);
     return r;
   });
   ipcMain.handle('account:importFromText', (_, rawText, options) => {

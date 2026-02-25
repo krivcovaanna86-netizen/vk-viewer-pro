@@ -2049,6 +2049,13 @@ class PlaywrightEngine {
   async searchAndFindVideo(page, keywords, targetUrl) {
     this.log(`[Search] Searching for video: ${keywords || targetUrl}`);
     
+    // Extract video ID from target URL for matching (e.g., "video-224119603_456311034")
+    let targetVideoId = null;
+    if (targetUrl) {
+      const match = targetUrl.match(/(video-?\d+_\d+)/);
+      if (match) targetVideoId = match[1];
+    }
+    
     try {
       await page.goto('https://vk.com/video', { waitUntil: 'domcontentloaded', timeout: 20000 });
       await this._humanDelay(2000, 3000);
@@ -2060,43 +2067,57 @@ class PlaywrightEngine {
           await page.keyboard.press('Enter');
           await this._humanDelay(3000, 5000);
 
-          // Look for the target video in results
-          if (targetUrl) {
-            const found = await page.evaluate((url) => {
+          // Scroll through results a few times to load more
+          for (let scroll = 0; scroll < 3; scroll++) {
+            await page.mouse.wheel(0, this._randomDelay(300, 600));
+            await this._humanDelay(1000, 2000);
+          }
+
+          // Look for the target video in results by video ID
+          if (targetVideoId) {
+            const found = await page.evaluate((videoId) => {
               const links = document.querySelectorAll('a[href*="/video"]');
               for (const link of links) {
-                const href = link.href || '';
-                if (href.includes(url)) {
+                const href = link.href || link.getAttribute('href') || '';
+                if (href.includes(videoId)) {
                   link.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  link.click();
                   return { found: true, href };
                 }
               }
               return { found: false };
-            }, targetUrl);
+            }, targetVideoId);
 
             if (found.found) {
-              this.log(`[Search] Found target video: ${found.href}`);
-              await page.click(`a[href*="${targetUrl}"]`);
+              this.log(`[Search] Found target video in results: ${found.href}`);
               await this._humanDelay(2000, 3000);
               return true;
             }
+            
+            this.log('[Search] Target video not found in search results, navigating directly...');
           }
-
-          // Click first video result
-          try {
-            const firstVideo = page.locator('a[href*="/video-"]').first();
-            if (await firstVideo.isVisible({ timeout: 3000 })) {
-              await firstVideo.click();
-              await this._humanDelay(2000, 3000);
-              return true;
-            }
-          } catch (e) {}
         }
       }
       
+      // Fallback: navigate directly to target URL instead of clicking a random video
+      if (targetUrl) {
+        this.log(`[Search] Navigating directly to: ${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await this._humanDelay(2000, 3000);
+        return true;
+      }
+
       return false;
     } catch (error) {
       this.log(`[Search] Error: ${error.message}`);
+      // Last resort: navigate directly
+      if (targetUrl) {
+        try {
+          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await this._humanDelay(2000, 3000);
+          return true;
+        } catch (e) {}
+      }
       return false;
     }
   }
@@ -2254,7 +2275,7 @@ class PlaywrightEngine {
     } = task;
 
     if (!videoUrl) {
-      return { success: false, error: 'No video URL' };
+      throw new Error('No video URL specified');
     }
 
     this.log(`[Task] Starting engagement task for: ${videoUrl}`);
@@ -2317,9 +2338,10 @@ class PlaywrightEngine {
 
           if (onProgress) {
             onProgress({
-              completed: batchStart + idx + 1,
+              current: batchStart + idx + 1,
               total: ops.length,
-              ...results,
+              status: result?.error ? 'error' : 'ok',
+              message: `Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Errors: ${results.errors}`,
             });
           }
 
@@ -2331,7 +2353,7 @@ class PlaywrightEngine {
     }
 
     this.log(`[Task] Completed. Views: ${results.views}, Likes: ${results.likes}, Comments: ${results.comments}, Errors: ${results.errors}`);
-    return { success: true, results };
+    return results;
   }
 
   async _executeSingleOp(op, task, settings) {
@@ -2422,7 +2444,13 @@ class PlaywrightEngine {
 
       // Navigate to video
       if (useSearch && searchKeywords) {
-        await this.searchAndFindVideo(page, searchKeywords, videoUrl);
+        const found = await this.searchAndFindVideo(page, searchKeywords, videoUrl);
+        // If search did not navigate to any video, go directly
+        if (!found && videoUrl) {
+          this.log('[Op] Search failed, navigating directly to video URL...');
+          await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await this._humanDelay(2000, 3000);
+        }
       } else {
         await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
         await this._humanDelay(2000, 3000);
