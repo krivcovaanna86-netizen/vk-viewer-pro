@@ -150,6 +150,26 @@ function setupIPC() {
     sendLog('info', `Cleared ${bpIds.length} Best-Proxies.ru proxies`);
     return { removed: bpIds.length };
   });
+  ipcMain.handle('proxy:testAll', async () => {
+    const total = proxyManager.getAll().length;
+    if (total === 0) {
+      sendLog('warn', 'No proxies to test');
+      return { tested: 0, alive: 0, dead: 0, removed: 0 };
+    }
+    sendLog('info', `⚡ Testing all ${total} proxies (real Chrome + vk.com)...`);
+    const r = await proxyManager.testAll((progress) => {
+      const status = progress.success
+        ? `✅ ${progress.proxy} → ${progress.ip} (${progress.latency}ms)`
+        : `❌ ${progress.proxy} → ${progress.error?.substring(0, 60)}`;
+      sendLog(progress.success ? 'info' : 'warn', `[Proxy ${progress.current}/${progress.total}] ${status}`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('proxy:testAllProgress', progress);
+      }
+    });
+    sendLog(r.dead > 0 ? 'warn' : 'success',
+      `⚡ Proxy test complete: ${r.alive} alive, ${r.dead} dead${r.removed > 0 ? ` (${r.removed} removed)` : ''}`);
+    return r;
+  });
 
   // ===== ACCOUNTS =====
   ipcMain.handle('account:getAll', () => accountManager.getAll());

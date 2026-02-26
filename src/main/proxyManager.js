@@ -388,6 +388,26 @@ class ProxyManager {
 
   // ───────── Proxy testing ─────────
 
+  /**
+   * Build proxy server URL for Playwright. Uses .type field (http/https/socks4/socks5).
+   * Playwright proxy: socks4 → socks5, https → http.
+   */
+  buildProxyUrl(proxy) {
+    let proto = (proxy.type || 'http').toLowerCase();
+    if (proto === 'https') proto = 'http';
+    if (proto === 'socks4') proto = 'socks5';
+    if (proxy.username && proxy.password) {
+      return `${proto}://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`;
+    }
+    return `${proto}://${proxy.host}:${proxy.port}`;
+  }
+
+  /**
+   * Test a single proxy by loading vk.com through real Chrome (same as task conditions).
+   * Two-phase test:
+   *   1) Quick IP check via api.ipify.org (HTTP, 10s)
+   *   2) Real VK load via vk.com/feed (HTTPS, 30s) — catches proxy blocks and TLS issues
+   */
   async test(id) {
     const proxy = this.getById(id);
     if (!proxy) return { success: false, error: 'Proxy not found' };
@@ -395,37 +415,107 @@ class ProxyManager {
     let browser = null;
     try {
       const { chromium } = require('playwright');
-      const protocol = proxy.type === 'socks5' ? 'socks5' : proxy.type === 'socks4' ? 'socks5' : 'http';
-      const proxyConfig = { server: `${protocol}://${proxy.host}:${proxy.port}` };
+      const proxyServer = this.buildProxyUrl(proxy);
+      const proxyConfig = { server: proxyServer };
       if (proxy.username && proxy.password) {
         proxyConfig.username = proxy.username;
         proxyConfig.password = proxy.password;
       }
-      browser = await chromium.launch({ proxy: proxyConfig, headless: true, args: ['--no-sandbox'] });
+
+      // Use real Chrome if available (same as task engine), fall back to Playwright Chromium
+      const launchOpts = {
+        proxy: proxyConfig,
+        headless: true,
+        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+      };
+      const fs = require('fs');
+      const chromePaths = [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      ];
+      for (const p of chromePaths) {
+        if (fs.existsSync(p)) { launchOpts.executablePath = p; break; }
+      }
+
+      browser = await chromium.launch(launchOpts);
       const context = await browser.newContext();
       const page = await context.newPage();
-      const response = await page.goto('http://api.ipify.org?format=json', { timeout: 15000, waitUntil: 'domcontentloaded' });
-      const body = await response.text();
-      const data = JSON.parse(body);
+
+      // Phase 1: Quick IP check
+      let ip = null;
+      try {
+        const response = await page.goto('http://api.ipify.org?format=json', { timeout: 10000, waitUntil: 'domcontentloaded' });
+        const body = await response.text();
+        ip = JSON.parse(body).ip;
+      } catch (e) {
+        // ipify failed but proxy may still work for VK
+      }
+
+      // Phase 2: Real VK test — this is what actually matters
+      const vkStart = Date.now();
+      await page.goto('https://vk.com/', { timeout: 30000, waitUntil: 'domcontentloaded' });
+      const currentUrl = page.url();
+      const vkLatency = Date.now() - vkStart;
+
+      // Check for proxy error pages
+      if (currentUrl.includes('chrome-error') || currentUrl === 'about:blank') {
+        throw new Error(`Proxy cannot reach vk.com (${currentUrl.substring(0, 50)})`);
+      }
+
       await browser.close();
       browser = null;
       const latency = Date.now() - start;
-      this.updateProxy(id, { status: 'active', lastCheck: new Date().toISOString(), latency, ip: data.ip });
-      return { success: true, ip: data.ip, latency };
+      this.updateProxy(id, { status: 'active', lastCheck: new Date().toISOString(), latency, vkLatency, ip: ip || '?' });
+      return { success: true, ip: ip || '?', latency, vkLatency };
     } catch (e) {
-      this.updateProxy(id, { status: 'dead', lastCheck: new Date().toISOString() });
+      this.updateProxy(id, { status: 'dead', lastCheck: new Date().toISOString(), lastError: e.message });
       return { success: false, error: e.message };
     } finally {
       if (browser) try { await browser.close(); } catch (_) {}
     }
   }
 
-  buildProxyUrl(proxy) {
-    const protocol = proxy.type === 'socks5' ? 'socks5' : 'http';
-    if (proxy.username && proxy.password) {
-      return `${protocol}://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`;
+  /**
+   * Test all proxies, remove dead ones.
+   * @param {function} onProgress - callback({current, total, proxy, result})
+   * @returns {{ tested, alive, dead, removed }}
+   */
+  async testAll(onProgress) {
+    const proxies = this.getAll();
+    const results = { tested: 0, alive: 0, dead: 0, removed: 0, deadIds: [] };
+
+    for (let i = 0; i < proxies.length; i++) {
+      const proxy = proxies[i];
+      const r = await this.test(proxy.id);
+      results.tested++;
+      if (r.success) {
+        results.alive++;
+      } else {
+        results.dead++;
+        results.deadIds.push(proxy.id);
+      }
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: proxies.length,
+          proxy: `${proxy.type}://${proxy.host}:${proxy.port}`,
+          success: r.success,
+          ip: r.ip,
+          latency: r.latency,
+          error: r.error,
+        });
+      }
     }
-    return `${protocol}://${proxy.host}:${proxy.port}`;
+
+    // Remove dead proxies
+    if (results.deadIds.length > 0) {
+      this.bulkRemove(results.deadIds);
+      results.removed = results.deadIds.length;
+    }
+
+    return results;
   }
 }
 

@@ -392,6 +392,39 @@ async function removeProxy(id) {
   } catch (e) { showToast(`Remove error: ${e.message}`, 'error'); }
 }
 
+// Test All Proxies & Remove Dead
+document.getElementById('btnTestAllProxies').addEventListener('click', async () => {
+  const btn = document.getElementById('btnTestAllProxies');
+  const origText = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Testing...';
+  showToast('Testing all proxies against vk.com (real Chrome)...', 'info');
+
+  // Listen for progress updates
+  const progressHandler = (progress) => {
+    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${progress.current}/${progress.total}`;
+    loadProxies(); // Refresh table to show status changes
+  };
+  window.api.proxy.onTestAllProgress(progressHandler);
+
+  try {
+    const r = await window.api.proxy.testAll();
+    if (r.dead > 0) {
+      showToast(`Done: ${r.alive} alive, ${r.dead} dead (${r.removed} removed)`, 'warning');
+    } else if (r.tested > 0) {
+      showToast(`All ${r.alive} proxies are working!`, 'success');
+    } else {
+      showToast('No proxies to test', 'info');
+    }
+    loadProxies();
+  } catch (e) {
+    showToast(`Test error: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = origText;
+  }
+});
+
 // ─── Best-Proxies.ru Panel ───
 
 const bpPanel = document.getElementById('bpPanel');

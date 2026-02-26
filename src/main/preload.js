@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld('api', {
     getBestProxiesStats: (key) => ipcRenderer.invoke('proxy:getBestProxiesStats', key),
     getBestProxiesKeyInfo: (key, format) => ipcRenderer.invoke('proxy:getBestProxiesKeyInfo', key, format),
     clearBestProxies: () => ipcRenderer.invoke('proxy:clearBestProxies'),
+    testAll: () => ipcRenderer.invoke('proxy:testAll'),
+    onTestAllProgress: (cb) => ipcRenderer.on('proxy:testAllProgress', (_, d) => cb(d)),
   },
 
   // Accounts
