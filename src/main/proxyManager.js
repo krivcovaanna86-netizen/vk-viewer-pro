@@ -415,8 +415,11 @@ class ProxyManager {
     let browser = null;
     try {
       const { chromium } = require('playwright');
-      const proxyServer = this.buildProxyUrl(proxy);
-      const proxyConfig = { server: proxyServer };
+      // Playwright proxy config: server URL + separate username/password
+      let proto = (proxy.type || 'http').toLowerCase();
+      if (proto === 'https') proto = 'http';
+      if (proto === 'socks4') proto = 'socks5';
+      const proxyConfig = { server: `${proto}://${proxy.host}:${proxy.port}` };
       if (proxy.username && proxy.password) {
         proxyConfig.username = proxy.username;
         proxyConfig.password = proxy.password;
@@ -443,10 +446,10 @@ class ProxyManager {
       const context = await browser.newContext();
       const page = await context.newPage();
 
-      // Phase 1: Quick IP check
+      // Phase 1: Quick IP check (non-essential, 5s max)
       let ip = null;
       try {
-        const response = await page.goto('http://api.ipify.org?format=json', { timeout: 10000, waitUntil: 'domcontentloaded' });
+        const response = await page.goto('http://api.ipify.org?format=json', { timeout: 5000, waitUntil: 'domcontentloaded' });
         const body = await response.text();
         ip = JSON.parse(body).ip;
       } catch (e) {
@@ -455,7 +458,7 @@ class ProxyManager {
 
       // Phase 2: Real VK test — this is what actually matters
       const vkStart = Date.now();
-      await page.goto('https://vk.com/', { timeout: 30000, waitUntil: 'domcontentloaded' });
+      await page.goto('https://vk.com/', { timeout: 15000, waitUntil: 'domcontentloaded' });
       const currentUrl = page.url();
       const vkLatency = Date.now() - vkStart;
 
@@ -478,35 +481,42 @@ class ProxyManager {
   }
 
   /**
-   * Test all proxies, remove dead ones.
-   * @param {function} onProgress - callback({current, total, proxy, result})
+   * Test all proxies in parallel batches, remove dead ones.
+   * @param {function} onProgress - callback({current, total, proxy, success, ip, latency, error})
+   * @param {number} concurrency - how many proxies to test at once (default 5)
    * @returns {{ tested, alive, dead, removed }}
    */
-  async testAll(onProgress) {
+  async testAll(onProgress, concurrency = 10) {
     const proxies = this.getAll();
     const results = { tested: 0, alive: 0, dead: 0, removed: 0, deadIds: [] };
+    let completed = 0;
 
-    for (let i = 0; i < proxies.length; i++) {
-      const proxy = proxies[i];
-      const r = await this.test(proxy.id);
-      results.tested++;
-      if (r.success) {
-        results.alive++;
-      } else {
-        results.dead++;
-        results.deadIds.push(proxy.id);
-      }
-      if (onProgress) {
-        onProgress({
-          current: i + 1,
-          total: proxies.length,
-          proxy: `${proxy.type}://${proxy.host}:${proxy.port}`,
-          success: r.success,
-          ip: r.ip,
-          latency: r.latency,
-          error: r.error,
-        });
-      }
+    // Process in parallel batches
+    for (let i = 0; i < proxies.length; i += concurrency) {
+      const batch = proxies.slice(i, i + concurrency);
+      const batchPromises = batch.map(async (proxy) => {
+        const r = await this.test(proxy.id);
+        completed++;
+        if (r.success) {
+          results.alive++;
+        } else {
+          results.dead++;
+          results.deadIds.push(proxy.id);
+        }
+        results.tested++;
+        if (onProgress) {
+          onProgress({
+            current: completed,
+            total: proxies.length,
+            proxy: `${proxy.type}://${proxy.host}:${proxy.port}`,
+            success: r.success,
+            ip: r.ip,
+            latency: r.latency,
+            error: r.error,
+          });
+        }
+      });
+      await Promise.all(batchPromises);
     }
 
     // Remove dead proxies

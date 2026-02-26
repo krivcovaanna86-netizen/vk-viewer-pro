@@ -43,11 +43,14 @@ class PlaywrightEngine {
       // Formats: ip:port, ip:port:user:pass, user:pass@ip:port, protocol://user:pass@ip:port
       let str = proxyString.trim();
       let protocol = 'http';
-      if (str.startsWith('http://') || str.startsWith('https://') || str.startsWith('socks5://')) {
+      if (str.startsWith('http://') || str.startsWith('https://') || str.startsWith('socks5://') || str.startsWith('socks4://')) {
         const idx = str.indexOf('://');
         protocol = str.substring(0, idx);
         str = str.substring(idx + 3);
       }
+      // Playwright only supports http and socks5 proxy protocols
+      if (protocol === 'https') protocol = 'http';
+      if (protocol === 'socks4') protocol = 'socks5';
       let username, password, server;
       if (str.includes('@')) {
         const [auth, host] = str.split('@');
@@ -66,8 +69,8 @@ class PlaywrightEngine {
         }
       }
       const proxy = { server };
-      if (username) proxy.username = username;
-      if (password) proxy.password = password;
+      if (username) proxy.username = decodeURIComponent(username);
+      if (password) proxy.password = decodeURIComponent(password);
       return proxy;
     } catch (e) {
       this.log(`[Proxy] Parse error: ${e.message}`);
@@ -197,6 +200,10 @@ class PlaywrightEngine {
       launchOpts.proxy = typeof options.proxy === 'string' 
         ? this._parseProxy(options.proxy) 
         : options.proxy;
+      if (launchOpts.proxy) {
+        const pInfo = launchOpts.proxy;
+        this.log(`[Engine] Proxy config: server=${pInfo.server}${pInfo.username ? `, auth=${pInfo.username.substring(0, 3)}***` : ''}`);
+      }
     }
 
     let browser;
@@ -472,78 +479,112 @@ class PlaywrightEngine {
     try {
       // ── Step 1: Navigate to vk.com ──
       this.log('[VK Login] Step 1: Navigating to vk.com...');
-      await this._safeGoto(page, 'https://vk.com/', { label: 'vk.com main', timeout: 25000 });
-      // Wait for VK SPA to render — without this the page "drifts" and bot clicks on nothing
-      await this._waitForPageReady(page);
-      await this._humanDelay(2000, 3000);
+      let onAuthPage = false; // true if we landed directly on id.vk.com/auth
+      const navOk = await this._safeGoto(page, 'https://vk.com/', { label: 'vk.com main', timeout: 25000 });
+      
+      // Check for dead proxy IMMEDIATELY — don't waste time on empty page
+      const startUrl = page.url();
+      if (startUrl.includes('chrome-error') || startUrl === 'about:blank' || (!navOk && !startUrl.includes('vk.com'))) {
+        this.log(`[VK Login] ⚠️ vk.com unreachable (url: ${startUrl.substring(0, 50)}), trying id.vk.com...`);
+        const fallbackOk = await this._safeGoto(page, 'https://id.vk.com/auth', { label: 'id.vk.com/auth direct', timeout: 25000 });
+        const fallbackUrl = page.url();
+        if (!fallbackOk || fallbackUrl.includes('chrome-error') || fallbackUrl === 'about:blank' || !fallbackUrl.includes('vk.com')) {
+          this.log(`[VK Login] ❌ Proxy cannot reach any VK domain (url: ${fallbackUrl.substring(0, 50)})`);
+          return { success: false, error: 'proxy_error', proxyDead: true };
+        }
+        await this._waitForPageReady(page);
+        await this._humanDelay(2000, 3000);
+        onAuthPage = true; // We're on id.vk.com/auth — skip "Войти другим способом"
+        this.log('[VK Login] Landed on id.vk.com/auth directly');
+      } else if (!navOk) {
+        // _safeGoto returned false but URL has vk.com — partial load
+        this.log('[VK Login] ⚠️ Partial vk.com load, trying id.vk.com/auth...');
+        const fallbackOk = await this._safeGoto(page, 'https://id.vk.com/auth', { label: 'id.vk.com/auth fallback', timeout: 25000 });
+        const fallbackUrl = page.url();
+        if (!fallbackOk || fallbackUrl.includes('chrome-error') || fallbackUrl === 'about:blank') {
+          this.log(`[VK Login] ❌ Proxy cannot reach id.vk.com`);
+          return { success: false, error: 'proxy_error', proxyDead: true };
+        }
+        await this._waitForPageReady(page);
+        await this._humanDelay(2000, 3000);
+        onAuthPage = true;
+        this.log('[VK Login] Landed on id.vk.com/auth via fallback');
+      } else {
+        // Wait for VK SPA to render — without this the page "drifts" and bot clicks on nothing
+        await this._waitForPageReady(page);
+        await this._humanDelay(2000, 3000);
+      }
 
       // ── Step 1a: Handle robot challenge on initial load ──
       await this._handleRobotChallenge(page);
 
-      // ── Step 2: Click "Войти другим способом" / "Log in another way" ──
-      // From Python ref: buttons with text variants for both Russian and English
-      this.log('[VK Login] Step 2: Looking for "Войти другим способом"...');
-      let foundAltLogin = false;
+      // ── Step 2: Click "Войти другим способом" (only on vk.com homepage, NOT on id.vk.com/auth) ──
+      if (!onAuthPage) {
+        this.log('[VK Login] Step 2: Looking for "Войти другим способом"...');
+        let foundAltLogin = false;
 
-      // Approach 1: evaluate (matches Python reference pattern)
-      try {
-        foundAltLogin = await page.evaluate(() => {
-          const variants = [
-            'войти другим способом', 'другие способы входа',
-            'log in another way', 'sign in another way',
-          ];
-          const elements = document.querySelectorAll('button, a, span, div[role="button"]');
-          for (const el of elements) {
-            const text = (el.textContent || '').trim().toLowerCase();
-            if (text.length > 60 || text.length === 0) continue;
-            if (el.offsetParent === null) continue;
-            if (!['a', 'button', 'span', 'div'].includes(el.tagName.toLowerCase())) continue;
-            if (variants.some(v => text.includes(v))) {
-              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              el.click();
-              return true;
+        // Approach 1: evaluate (matches Python reference pattern)
+        try {
+          foundAltLogin = await page.evaluate(() => {
+            const variants = [
+              'войти другим способом', 'другие способы входа',
+              'log in another way', 'sign in another way',
+            ];
+            const elements = document.querySelectorAll('button, a, span, div[role="button"]');
+            for (const el of elements) {
+              const text = (el.textContent || '').trim().toLowerCase();
+              if (text.length > 60 || text.length === 0) continue;
+              if (el.offsetParent === null) continue;
+              if (!['a', 'button', 'span', 'div'].includes(el.tagName.toLowerCase())) continue;
+              if (variants.some(v => text.includes(v))) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.click();
+                return true;
+              }
             }
+            return false;
+          });
+          if (foundAltLogin) {
+            this.log('[VK Login] Clicked "Войти другим способом"');
+            // Wait for page to settle after click — this prevents "drifting"
+            await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+            await this._humanDelay(2000, 3000);
           }
-          return false;
-        });
-        if (foundAltLogin) {
-          this.log('[VK Login] Clicked "Войти другим способом"');
-          // Wait for page to settle after click — this prevents "drifting"
-          await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+        } catch (e) {}
+
+        // Approach 2: Playwright locators
+        if (!foundAltLogin) {
+          const altLoginSelectors = [
+            'button:has-text("Войти другим способом")',
+            'a:has-text("Войти другим способом")',
+            'span:has-text("Войти другим способом")',
+            '[data-testid="loginByPassword"]',
+            'button:has-text("Other login methods")',
+            'a:has-text("Log in another way")',
+          ];
+          for (const sel of altLoginSelectors) {
+            try {
+              const btn = page.locator(sel).first();
+              if (await btn.isVisible({ timeout: 1500 })) {
+                await btn.click();
+                foundAltLogin = true;
+                this.log(`[VK Login] Clicked alt login via locator: ${sel}`);
+                await this._humanDelay(2000, 3000);
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+
+        // If still not found, go directly to id.vk.com
+        if (!foundAltLogin) {
+          this.log('[VK Login] Alt login not found, navigating to id.vk.com/auth...');
+          await this._safeGoto(page, 'https://id.vk.com/auth', { label: 'id.vk.com/auth fallback', timeout: 25000 });
+          await this._waitForPageReady(page);
           await this._humanDelay(2000, 3000);
         }
-      } catch (e) {}
-
-      // Approach 2: Playwright locators
-      if (!foundAltLogin) {
-        const altLoginSelectors = [
-          'button:has-text("Войти другим способом")',
-          'a:has-text("Войти другим способом")',
-          'span:has-text("Войти другим способом")',
-          '[data-testid="loginByPassword"]',
-          'button:has-text("Other login methods")',
-          'a:has-text("Log in another way")',
-        ];
-        for (const sel of altLoginSelectors) {
-          try {
-            const btn = page.locator(sel).first();
-            if (await btn.isVisible({ timeout: 1500 })) {
-              await btn.click();
-              foundAltLogin = true;
-              this.log(`[VK Login] Clicked alt login via locator: ${sel}`);
-              await this._humanDelay(2000, 3000);
-              break;
-            }
-          } catch (e) {}
-        }
-      }
-
-      // If still not found, go directly to id.vk.com
-      if (!foundAltLogin) {
-        this.log('[VK Login] Alt login not found, navigating to id.vk.com/auth...');
-        await this._safeGoto(page, 'https://id.vk.com/auth', { label: 'id.vk.com/auth fallback', timeout: 25000 });
-        await this._waitForPageReady(page);
-        await this._humanDelay(2000, 3000);
+      } else {
+        this.log('[VK Login] Step 2: Skipped (already on id.vk.com/auth)');
       }
 
       // ── Step 2a: Robot challenge again ──
@@ -3375,7 +3416,24 @@ class PlaywrightEngine {
             const loginResult = await this.loginVK(page, account.login, account.password);
             const loginTime = ((Date.now() - loginStart) / 1000).toFixed(1);
             
-            // Check if login failed due to proxy error
+            // Check if login failed due to proxy error — trigger failover
+            if (loginResult.proxyDead) {
+              this.log(`[Op] \u274c Proxy dead during login (${loginTime}s), will try next proxy...`);
+              await this._safeClose(contextId);
+              contextId = null;
+              // Mark this proxy as failed
+              if (currentProxyId) {
+                const proxyIdx = allProxies.findIndex(p => p.id === currentProxyId);
+                if (proxyIdx !== -1) {
+                  allProxies[proxyIdx].status = 'error';
+                  allProxies[proxyIdx].lastError = new Date().toISOString();
+                  this.store.set('proxies', allProxies);
+                }
+              }
+              continue; // Try next proxy
+            }
+            
+            // Also check chrome-error URL (legacy check)
             const postLoginUrl = page.url();
             if (postLoginUrl.includes('chrome-error')) {
               this.log(`[Op] \u274c Proxy error during login, will try next proxy...`);
